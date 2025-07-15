@@ -4,6 +4,8 @@ exception SemanticError of string
 open ToyC_riscv_lib.Ast
 open ToyC_riscv_lib
 
+module StringMap = Map.Make(String)
+
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
   | Num n -> string_of_int n
@@ -61,64 +63,148 @@ let rec check_return_coverage stmt =
   | ReturnStmt _ -> true
   | _ -> false
 
+  type func_signature = { ret_type: typ; params: param list } 
+  let func_table = Hashtbl.create 30
+  
+  let collect_functions ast =
+    List.iter (fun fd ->
+      Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
+    ) ast
+  (*检查函数调用*)
+  let rec check_expr_calls expr =
+    match expr with
+    | Call (name, args) ->
+        if not (Hashtbl.mem func_table name) then
+          raise (SemanticError ("function " ^ name ^ " called but not defined"));
+        List.iter check_expr_calls args
+    | Unary (_, e) -> check_expr_calls e
+    | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
+    | _ -> ()
 (* 语义分析主函数 *)
 let semantic_analysis ast =
-  (* 检查 main 函数存在且符合要求 *)
+  collect_functions ast;
   let has_main = ref false in
-  List.iter (fun fd ->
+  (* Symbol table stack, initialized with global scope *)
+  let scope_stack = ref [StringMap.empty] in
+  (* Enter a new scope *)
+  let enter_scope () =
+    scope_stack := StringMap.empty :: !scope_stack
+  in
+  (* Exit the current scope *)
+  let leave_scope () =
+    scope_stack := List.tl !scope_stack
+  in
+  (* Add a variable to the current scope *)
+  let add_var name typ =
+    match !scope_stack with
+    | current :: rest ->
+        if StringMap.mem name current then
+          raise (SemanticError ("variable " ^ name ^ " redeclared"));
+        scope_stack := StringMap.add name typ current :: rest
+    | [] -> failwith "scope stack empty"
+  in
+  (* Look up variable type *)
+  let rec find_var name = function
+    | [] -> None
+    | scope :: rest ->
+        match StringMap.find_opt name scope with
+        | Some t -> Some t
+        | None -> find_var name rest
+  in
+  (* Infer expression type *)
+  let rec infer_expr_type expr =
+    match expr with
+    | Num _ -> Int
+    | Var v ->
+        (match find_var v !scope_stack with
+         | Some t -> t
+         | None -> raise (SemanticError ("variable " ^ v ^ " used before declaration")))
+    | Call (name, args) ->
+        let { ret_type; params } = Hashtbl.find func_table name in
+        if List.length args <> List.length params then
+          raise (SemanticError ("function " ^ name ^ " called with wrong number of arguments"));
+        List.iter2 (fun arg param ->
+          let arg_type = infer_expr_type arg in
+          if arg_type <> param.typ then
+            raise (SemanticError ("type mismatch in argument of function " ^ name))
+        ) args params;
+        ret_type
+    | Unary (op, e) ->
+        (match op with
+         | Plus | Minus -> infer_expr_type e
+         | Not -> Int)
+    | Binary (op, e1, e2) ->
+        let t1 = infer_expr_type e1 in
+        let t2 = infer_expr_type e2 in
+        if t1 <> Int || t2 <> Int then
+          raise (SemanticError "binary operation only supports int types");
+        Int
+  in
+  (* Check statement types, variable declarations, uses, and function calls *)
+  let rec check_stmt stmt expected_ret_type in_loop =
+    match stmt with
+    | DeclStmt (t, name, e_opt) ->
+        add_var name t; (* Add variable to scope before checking expression *)
+        (match e_opt with
+         | Some e ->
+             let expr_type = infer_expr_type e in
+             if expr_type <> t then
+               raise (SemanticError ("type mismatch in declaration of " ^ name))
+         | None -> ())
+    | AssignStmt (name, e) ->
+        (match find_var name !scope_stack with
+         | None -> raise (SemanticError ("variable " ^ name ^ " used before declaration"))
+         | Some t ->
+             let expr_type = infer_expr_type e in
+             if expr_type <> t then
+               raise (SemanticError ("type mismatch in assignment to " ^ name)))
+    | ExprStmt e -> ignore (infer_expr_type e); check_expr_calls e
+    | ReturnStmt (Some e) ->
+        let expr_type = infer_expr_type e in
+        if expr_type <> expected_ret_type then
+          raise (SemanticError "return type mismatch")
+    | ReturnStmt None ->
+        if expected_ret_type <> Void then
+          raise (SemanticError "missing return value in non-void function")
+    | BlockStmt b ->
+        enter_scope ();
+        List.iter (fun s -> check_stmt s expected_ret_type in_loop) b.stmts;
+        leave_scope ()
+    | IfStmt (cond, then_stmt, else_stmt_opt) ->
+        ignore (infer_expr_type cond);
+        check_stmt then_stmt expected_ret_type in_loop;
+        Option.iter (fun s -> check_stmt s expected_ret_type in_loop) else_stmt_opt
+    | WhileStmt (cond, s) ->
+        ignore (infer_expr_type cond);
+        check_stmt s expected_ret_type true
+    | BreakStmt | ContinueStmt ->
+        if not in_loop then raise (SemanticError "break/continue must be inside a loop")
+  and check_expr_calls expr =
+    match expr with
+    | Call (name, args) ->
+        if not (Hashtbl.mem func_table name) then
+          raise (SemanticError ("function " ^ name ^ " called but not defined"));
+        List.iter check_expr_calls args
+    | Unary (_, e) -> check_expr_calls e
+    | Binary (_, e1, e2) -> check_expr_calls e1; check_expr_calls e2
+    | _ -> ()
+  in
+  List.iter (fun (fd : ToyC_riscv_lib.Ast.func_def) ->
     if fd.name = "main" then (
       has_main := true;
-      if fd.params <> [] then
-        raise (SemanticError "main function must have an empty parameter list");
-      if fd.ret_type <> Int then
-        raise (SemanticError "main function must return int");
+      if fd.params <> [] then raise (SemanticError "main function must have an empty parameter list");
+      if fd.ret_type <> Int then raise (SemanticError "main function must return int");
       if not (check_return_coverage (BlockStmt fd.body)) then
         raise (SemanticError "main function must return a value on all paths")
     ) else if fd.ret_type = Int && not (check_return_coverage (BlockStmt fd.body)) then
-      raise (SemanticError (fd.name ^ " function with int return type must return a value on all paths"))
+      raise (SemanticError (fd.name ^ " function with int return type must return a value on all paths"));
+    let param_names = List.map (fun (p : ToyC_riscv_lib.Ast.param) -> p.name) fd.params in
+    let initial_scope = List.fold_left (fun acc name -> StringMap.add name Int acc) StringMap.empty param_names in
+    scope_stack := initial_scope :: !scope_stack;
+    check_stmt (BlockStmt fd.body) fd.ret_type false;
+    scope_stack := List.tl !scope_stack
   ) ast;
-  if not !has_main then
-    raise (SemanticError "program must contain a main function");
-
-  (* 检查变量声明和使用 *)
-  let rec check_stmt_vars stmt declared_vars =
-    match stmt with
-    | DeclStmt (t, name, Some e) ->
-        if t <> Int then raise (SemanticError "only int type is supported for variables");
-        if List.mem name declared_vars then raise (SemanticError ("variable " ^ name ^ " redeclared"));
-        name :: declared_vars
-    | AssignStmt (name, e) ->
-        if not (List.mem name declared_vars) then raise (SemanticError ("variable " ^ name ^ " used before declaration"));
-        declared_vars
-    | BlockStmt b ->
-        List.fold_left (fun acc s -> check_stmt_vars s acc) declared_vars b.stmts
-    | IfStmt (_, then_stmt, else_stmt_opt) ->
-        let new_vars = check_stmt_vars then_stmt declared_vars in
-        (match else_stmt_opt with
-         | Some else_stmt -> check_stmt_vars else_stmt new_vars
-         | None -> new_vars)
-    | WhileStmt (_, s) -> check_stmt_vars s declared_vars
-    | _ -> declared_vars
-  in
-  List.iter (fun (fd : ToyC_riscv_lib.Ast.func_def) ->
-    let param_names = List.map (fun (p : ToyC_riscv_lib.Ast.param)  -> p.name) fd.params in
-    ignore (check_stmt_vars (BlockStmt fd.body) param_names)
-  ) ast;
-
-  (* 检查 break/continue 只在循环中 *)
-  let rec check_control_flow stmt in_loop =
-    match stmt with
-    | BreakStmt | ContinueStmt ->
-        if not in_loop then raise (SemanticError "break/continue must be inside a loop")
-    | BlockStmt b -> List.iter (fun s -> check_control_flow s in_loop) b.stmts
-    | IfStmt (_, then_stmt, else_stmt_opt) ->
-        check_control_flow then_stmt in_loop;
-        (match else_stmt_opt with Some else_stmt -> check_control_flow else_stmt in_loop | None -> ())
-    | WhileStmt (_, s) -> check_control_flow s true
-    | _ -> ()
-  in
-  List.iter (fun fd -> check_control_flow (BlockStmt fd.body) false) ast;
-
+  if not !has_main then raise (SemanticError "program must contain a main function");
   print_endline "Semantic analysis passed!"
 
 let parse_channel ch =
