@@ -3,7 +3,7 @@ exception SemanticError of string
 
 open ToyC_riscv_lib.Ast
 open ToyC_riscv_lib
-(*修改*)
+
 module StringMap = Map.Make(String)
 
 (* 将表达式转换为字符串 *)
