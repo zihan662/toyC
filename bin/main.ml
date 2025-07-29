@@ -60,26 +60,38 @@ let fresh_label state prefix =
 
 
 let get_var_offset state var =
-  (* 首先检查变量是否已在当前作用域中定义 *)
-  match state.scope_stack with
-  | current_scope :: _ ->
-      (try 
-         (Hashtbl.find current_scope var, state)  (* 在当前作用域找到 *)
-       with Not_found -> 
-         (* 在当前作用域添加新变量 *)
-         let offset = state.stack_size in
-         Hashtbl.add current_scope var offset;
-         let new_state = {state with stack_size = offset + 8} in
-         (offset, new_state))
-  | [] ->
-      (* 全局作用域 *)
-      (try 
-         (Hashtbl.find state.var_offset var, state)
-       with Not_found -> 
-         let offset = state.stack_size in
-         Hashtbl.add state.var_offset var offset;
-         let new_state = {state with stack_size = offset + 8} in
-         (offset, new_state))
+  (* 遍历作用域栈查找变量 *)
+  let rec find_var_in_scopes scopes =
+    match scopes with
+    | [] -> None
+    | current_scope :: rest ->
+        (try 
+           Some (Hashtbl.find current_scope var)
+         with Not_found -> 
+           find_var_in_scopes rest)
+  in
+  (* 先在作用域栈中查找 *)
+    match find_var_in_scopes state.scope_stack with
+    | Some offset -> (offset, state)  (* 找到了，直接返回 *)
+    | None ->
+        (* 在全局作用域中查找 *)
+        (try 
+          (Hashtbl.find state.var_offset var, state)
+        with Not_found -> 
+          (* 变量不存在，需要在适当的作用域中创建 *)
+          match state.scope_stack with
+          | current_scope :: _ ->
+              (* 在当前作用域添加新变量 *)
+              let offset = state.stack_size in
+              Hashtbl.add current_scope var offset;
+              let new_state = {state with stack_size = offset + 8} in
+              (offset, new_state)
+          | [] ->
+              (* 在全局作用域添加新变量 *)
+              let offset = state.stack_size in
+              Hashtbl.add state.var_offset var offset;
+              let new_state = {state with stack_size = offset + 8} in
+              (offset, new_state))
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
