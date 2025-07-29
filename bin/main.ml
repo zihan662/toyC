@@ -396,73 +396,97 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   }
 
 
-let () =
-  let ch = open_in "test/04_while_break.tc" in
-  let ast = parse_channel ch in
-  close_in ch;
-  semantic_analysis ast;
-  let ast_str = string_of_ast ast in
-  let out_ch = open_out "ast.txt" in
-  Printf.fprintf out_ch "%s\n" ast_str;
-  close_out out_ch;
-   let ir = List.map func_to_ir ast in  (* 转换整个AST为IR *)
-  
-  let string_of_ir ir_func =
-    let buf = Buffer.create 256 in
-    Buffer.add_string buf (Printf.sprintf "Function: %s\n" ir_func.name);
-    Buffer.add_string buf "Params: ";
-    List.iter (fun p -> Buffer.add_string buf (p ^ " ")) ir_func.params;
-    Buffer.add_string buf "\nBody:\n";
-    List.iter (fun instr ->
-      let instr_str = match instr with
-        | Li (r, n) -> Printf.sprintf "  li %s, %d" 
-                        (match r with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n) 
-                        n
-        | Mv (rd, rs) -> Printf.sprintf "  mv %s, %s" 
-                          (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-                          (match rs with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-        | BinaryOp (op, rd, rs1, rs2) ->
-            Printf.sprintf "  %s %s, %s, %s" op
-              (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              (match rs1 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              (match rs2 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-        | Branch (cond, rs1, rs2, label) ->
-            Printf.sprintf "  %s %s, %s, %s" cond
-              (match rs1 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              (match rs2 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              label
-        | Jmp label ->
-            Printf.sprintf "  j %s" label
-        | Label label ->
-            label ^ ":"
-        | Call func ->
-            Printf.sprintf "  call %s" func
-        | Ret ->
-            "  ret"
-        | Store (rs, base, offset) ->
-            Printf.sprintf "  sd %s, %d(%s)"
-              (match rs with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              offset
-              (match base with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-        | Load (rd, base, offset) ->
-            Printf.sprintf "  ld %s, %d(%s)"
-              (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-              offset
-              (match base with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
-      in
-      Buffer.add_string buf (instr_str ^ "\n")
-    ) ir_func.body;
-    Buffer.contents buf
-  in
-  
-  (* 6. 输出IR到文件 *)
-  let ir_out = open_out "risc-V.txt" in
-  List.iter (fun f -> 
-    Printf.fprintf ir_out "%s\n" (string_of_ir f)
-  ) ir;
-  close_out ir_out;
-  
+(* ==================== IR到RISC-V汇编转换 ==================== *)
+module IRToRiscV = struct
+  (* 寄存器分配映射：将临时寄存器映射到RISC-V物理寄存器 *)
+  let reg_map = function
+    | RiscvReg s -> s  (* 保留已有的RISC-V寄存器 *)
+    | Temp n -> 
+        (* 使用t0-t6临时寄存器，a0-a7参数寄存器 *)
+        if n < 7 then Printf.sprintf "t%d" n
+        else if n < 15 then Printf.sprintf "a%d" (n-7)
+        else failwith "Register allocation overflow"
 
-  print_endline "Compilation successful!";
-  print_endline ("AST written to ast.txt");
-  print_endline ("RISC-V written to risc-V.txt")
+  (* 指令转换 *)
+  let instr_to_asm = function
+    | Li (r, n) -> 
+        Printf.sprintf "  li %s, %d" (reg_map r) n
+    | Mv (rd, rs) ->
+        Printf.sprintf "  mv %s, %s" (reg_map rd) (reg_map rs)
+    | BinaryOp (op, rd, rs1, rs2) ->
+        Printf.sprintf "  %s %s, %s, %s" op (reg_map rd) (reg_map rs1) (reg_map rs2)
+    | Branch (cond, rs1, rs2, label) ->
+        (match cond with
+          | "beqz" -> Printf.sprintf "  beq %s, zero, %s" (reg_map rs1) label
+          | "bnez" -> Printf.sprintf "  bne %s, zero, %s" (reg_map rs1) label
+          | _ -> Printf.sprintf "  %s %s, %s, %s" cond (reg_map rs1) (reg_map rs2) label)
+    | Jmp label ->
+        "  j " ^ label
+    | Label label ->
+        label ^ ":"
+    | Call func ->
+       "  call " ^ func
+    | Ret ->
+       "  ret"
+    | Store (rs, base, offset) ->
+        Printf.sprintf "  sd %s, %d(%s)" (reg_map rs) offset (reg_map base)
+    | Load (rd, base, offset) ->
+        Printf.sprintf "  ld %s, %d(%s)" (reg_map rd) offset (reg_map base)
+
+  (* 函数序言和尾声 *)
+  let function_prologue name stack_size =
+    Printf.sprintf "%s:\n" name ^
+    "  addi sp, sp, -" ^ string_of_int stack_size ^ "\n" ^
+    "  sd ra, " ^ string_of_int (stack_size - 8) ^ "(sp)\n"
+
+  let function_epilogue stack_size =
+    "  ld ra, " ^ string_of_int (stack_size - 8) ^ "(sp)\n" ^
+    "  addi sp, sp, " ^ string_of_int stack_size ^ "\n" ^
+    "  ret\n"
+
+  (* 转换整个IR函数 *)
+  let func_to_asm ir_func =
+    let buf = Buffer.create 256 in
+    
+    (* 函数头 *)
+    Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
+    Buffer.add_string buf (function_prologue ir_func.name (8 * (List.length ir_func.params + 1)));
+    
+    (* 保存参数到栈帧 *)
+    List.iteri (fun i param ->
+      let offset = i * 8 in
+      Buffer.add_string buf (Printf.sprintf "  sd a%d, %d(sp)\n" i offset)
+    ) ir_func.params;
+    
+    (* 转换指令 *)
+    List.iter (fun instr ->
+      Buffer.add_string buf (instr_to_asm instr ^ "\n")
+    ) ir_func.body;
+    
+    (* 函数尾 *)
+    Buffer.add_string buf (function_epilogue (8 * (List.length ir_func.params + 1)));
+    Buffer.contents buf
+end
+
+(* 修改最后的输出部分 *)
+(* 修改最后的输出部分 *)
+let () =
+  let ast = parse_channel stdin in
+  semantic_analysis ast;
+  
+  (* 转换为IR *)
+  let ir = List.map func_to_ir ast in
+  
+  (* 转换为RISC-V汇编 *)
+  let riscv_asm = List.map IRToRiscV.func_to_asm ir in
+  
+  (* 输出RISC-V汇编到stdout *)
+  (* 添加汇编头部 *)
+  print_endline ".text";
+  (* 输出每个函数 *)
+  List.iter (fun f -> 
+    print_endline f
+  ) riscv_asm;
+  
+  (* 错误信息输出到stderr *)
+  prerr_endline "Compilation successful!"
