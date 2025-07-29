@@ -499,8 +499,10 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
+    scope_stack = [Hashtbl.create (List.length func.params)]; (* 初始化作用域栈 *)
   } in
-    let state' = 
+  (* 将参数添加到当前作用域 *)
+  let state' = 
     List.fold_left (fun st (param : Ast.param) ->
       let offset, st' = get_var_offset_for_declaration st param.name in
       st'
