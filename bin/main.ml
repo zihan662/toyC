@@ -60,36 +60,33 @@ let fresh_label state prefix =
 
 
 let get_var_offset state var =
-  (* 在所有作用域中查找变量，从当前作用域开始 *)
-  let rec find_var scopes =
+  (* 按照作用域栈的顺序查找变量，从最内层作用域开始 *)
+  let rec find_in_scope_stack scopes =
     match scopes with
     | [] -> None
     | scope :: rest ->
-        (try
+        (try 
            Some (Hashtbl.find scope var)
-         with Not_found ->
-           find_var rest)
+         with Not_found -> 
+           find_in_scope_stack rest)
   in
   
-  (* 首先尝试在所有作用域中查找变量 *)
-  match find_var state.scope_stack with
-  | Some offset -> 
-      (offset, state)  (* 找到变量，返回其偏移 *)
+  (* 先在作用域栈中查找 *)
+  match find_in_scope_stack state.scope_stack with
+  | Some offset -> (offset, state)
   | None ->
       (* 在全局作用域中查找 *)
-      (try
+      (try 
          (Hashtbl.find state.var_offset var, state)
-       with Not_found ->
-         (* 变量不存在，在当前作用域（或全局作用域）中创建 *)
+       with Not_found -> 
+         (* 变量不存在，在当前作用域中创建 *)
          match state.scope_stack with
          | current_scope :: _ ->
-             (* 在当前作用域添加新变量 *)
              let offset = state.stack_size in
              Hashtbl.add current_scope var offset;
              let new_state = {state with stack_size = offset + 8} in
              (offset, new_state)
          | [] ->
-             (* 在全局作用域添加新变量 *)
              let offset = state.stack_size in
              Hashtbl.add state.var_offset var offset;
              let new_state = {state with stack_size = offset + 8} in
