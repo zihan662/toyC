@@ -60,38 +60,40 @@ let fresh_label state prefix =
 
 
 let get_var_offset state var =
-  (* 遍历作用域栈查找变量 *)
-  let rec find_var_in_scopes scopes =
+  (* 在所有作用域中查找变量，从当前作用域开始 *)
+  let rec find_var scopes =
     match scopes with
     | [] -> None
-    | current_scope :: rest ->
-        (try 
-           Some (Hashtbl.find current_scope var)
-         with Not_found -> 
-           find_var_in_scopes rest)
+    | scope :: rest ->
+        (try
+           Some (Hashtbl.find scope var)
+         with Not_found ->
+           find_var rest)
   in
-  (* 先在作用域栈中查找 *)
-    match find_var_in_scopes state.scope_stack with
-    | Some offset -> (offset, state)  (* 找到了，直接返回 *)
-    | None ->
-        (* 在全局作用域中查找 *)
-        (try 
-          (Hashtbl.find state.var_offset var, state)
-        with Not_found -> 
-          (* 变量不存在，需要在适当的作用域中创建 *)
-          match state.scope_stack with
-          | current_scope :: _ ->
-              (* 在当前作用域添加新变量 *)
-              let offset = state.stack_size in
-              Hashtbl.add current_scope var offset;
-              let new_state = {state with stack_size = offset + 8} in
-              (offset, new_state)
-          | [] ->
-              (* 在全局作用域添加新变量 *)
-              let offset = state.stack_size in
-              Hashtbl.add state.var_offset var offset;
-              let new_state = {state with stack_size = offset + 8} in
-              (offset, new_state))
+  
+  (* 首先尝试在所有作用域中查找变量 *)
+  match find_var state.scope_stack with
+  | Some offset -> 
+      (offset, state)  (* 找到变量，返回其偏移 *)
+  | None ->
+      (* 在全局作用域中查找 *)
+      (try
+         (Hashtbl.find state.var_offset var, state)
+       with Not_found ->
+         (* 变量不存在，在当前作用域（或全局作用域）中创建 *)
+         match state.scope_stack with
+         | current_scope :: _ ->
+             (* 在当前作用域添加新变量 *)
+             let offset = state.stack_size in
+             Hashtbl.add current_scope var offset;
+             let new_state = {state with stack_size = offset + 8} in
+             (offset, new_state)
+         | [] ->
+             (* 在全局作用域添加新变量 *)
+             let offset = state.stack_size in
+             Hashtbl.add state.var_offset var offset;
+             let new_state = {state with stack_size = offset + 8} in
+             (offset, new_state))
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
