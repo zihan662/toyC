@@ -59,7 +59,7 @@ let fresh_label state prefix =
   (label, {state with label_counter = state.label_counter + 1})
 
 
-let get_var_offset state var =
+let get_var_offset_for_use state var =
   (* 在作用域栈中查找变量，从当前作用域开始向外 *)
   let rec lookup scopes =
     match scopes with
@@ -80,20 +80,23 @@ let get_var_offset state var =
       (try
          (Hashtbl.find state.var_offset var, state)
        with Not_found ->
-         (* 变量不存在，需要创建 *)
-         match state.scope_stack with
-         | current_scope :: _ ->
-             (* 在当前（最内层）作用域中创建变量 *)
-             let offset = state.stack_size in
-             Hashtbl.add current_scope var offset;
-             let new_state = {state with stack_size = offset + 8} in
-             (offset, new_state)
-         | [] ->
-             (* 在全局作用域中创建变量 *)
-             let offset = state.stack_size in
-             Hashtbl.add state.var_offset var offset;
-             let new_state = {state with stack_size = offset + 8} in
-             (offset, new_state))
+         (* 变量不存在，这应该是错误情况 *)
+         failwith ("Variable " ^ var ^ " not found"))
+
+let get_var_offset_for_declaration state var =
+  (* 变量声明时，只在当前作用域创建变量 *)
+  match state.scope_stack with
+  | current_scope :: _ ->
+      let offset = state.stack_size in
+      Hashtbl.add current_scope var offset;
+      let new_state = {state with stack_size = offset + 8} in
+      (offset, new_state)
+  | [] ->
+      (* 在全局作用域中创建变量 *)
+      let offset = state.stack_size in
+      Hashtbl.add state.var_offset var offset;
+      let new_state = {state with stack_size = offset + 8} in
+      (offset, new_state)
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -317,7 +320,7 @@ let rec expr_to_ir state expr =
       let (temp, state') = fresh_temp state in
       (temp, [Li (temp, n)], state')
   | Var x -> 
-      let offset, state' = get_var_offset state x in
+      let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "sp", offset)], state'')
   | Binary (op, e1, e2) ->
@@ -381,14 +384,14 @@ let rec stmt_to_ir state stmt =
   | BlockStmt b -> block_to_ir state b
   | DeclStmt (_, name, Some expr) -> (* 带初始化的声明 *)
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let offset, state'' = get_var_offset state' name in
+      let offset, state'' = get_var_offset_for_declaration state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
   | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
-      let offset, state' = get_var_offset state name in
+      let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
   | AssignStmt (name, expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let offset, state'' = get_var_offset state' name in
+      let offset, state'' = get_var_offset_for_use state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
   | IfStmt (cond, then_stmt, else_stmt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
@@ -462,7 +465,7 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   } in
     let state' = 
     List.fold_left (fun st (param : Ast.param) ->
-      let offset, st' = get_var_offset st param.name in
+      let offset, st' = get_var_offset_for_declaration st param.name in
       st'
     ) state func.params
   in
