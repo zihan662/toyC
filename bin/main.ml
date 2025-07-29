@@ -433,29 +433,35 @@ module IRToRiscV = struct
     | Load (rd, base, offset) ->
         Printf.sprintf "  ld %s, %d(%s)" (reg_map rd) offset (reg_map base)
 
-  (* 函数序言和尾声 *)
+  (* 函数序言和尾声 - 修改为标准的16字节对齐栈帧 *)
   let function_prologue name stack_size =
+    let aligned_size = if stack_size mod 16 = 0 then stack_size else ((stack_size / 16) + 1) * 16 in
     Printf.sprintf "%s:\n" name ^
-    "  addi sp, sp, -" ^ string_of_int stack_size ^ "\n" ^
-    "  sd ra, " ^ string_of_int (stack_size - 8) ^ "(sp)\n"
+    "  addi sp, sp, -" ^ string_of_int aligned_size ^ "\n" ^
+    "  sd ra, " ^ string_of_int (aligned_size - 8) ^ "(sp)\n" ^
+    "  sd s0, " ^ string_of_int (aligned_size - 16) ^ "(sp)\n" ^
+    "  addi s0, sp, " ^ string_of_int aligned_size ^ "\n"
 
   let function_epilogue stack_size =
-    "  ld ra, " ^ string_of_int (stack_size - 8) ^ "(sp)\n" ^
-    "  addi sp, sp, " ^ string_of_int stack_size ^ "\n" ^
-    "  ret\n"
+    let aligned_size = if stack_size mod 16 = 0 then stack_size else ((stack_size / 16) + 1) * 16 in
+    "  ld ra, " ^ string_of_int (aligned_size - 8) ^ "(sp)\n" ^
+    "  ld s0, " ^ string_of_int (aligned_size - 16) ^ "(sp)\n" ^
+    "  addi sp, sp, " ^ string_of_int aligned_size ^ "\n" ^
+    "  jr ra\n"
 
   (* 转换整个IR函数 *)
   let func_to_asm ir_func =
     let buf = Buffer.create 256 in
     
     (* 函数头 *)
-    Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
-    Buffer.add_string buf (function_prologue ir_func.name (8 * (List.length ir_func.params + 1)));
+    Buffer.add_string buf (Printf.sprintf ".globl %s\n" ir_func.name);
+    Buffer.add_string buf (Printf.sprintf ".type %s, @function\n" ir_func.name);
+    Buffer.add_string buf (function_prologue ir_func.name (8 * (List.length ir_func.params + 2)));  
     
     (* 保存参数到栈帧 *)
     List.iteri (fun i param ->
       let offset = i * 8 in
-      Buffer.add_string buf (Printf.sprintf "  sd a%d, %d(sp)\n" i offset)
+      Buffer.add_string buf (Printf.sprintf "  sd a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
     (* 转换指令 *)
@@ -463,8 +469,10 @@ module IRToRiscV = struct
       Buffer.add_string buf (instr_to_asm instr ^ "\n")
     ) ir_func.body;
     
-    (* 函数尾 *)
-    Buffer.add_string buf (function_epilogue (8 * (List.length ir_func.params + 1)));
+    (* 函数尾 - 只在没有ret指令时才添加 *)
+    if not (List.exists (function Ret -> true | _ -> false) ir_func.body) then
+      Buffer.add_string buf (function_epilogue (8 * (List.length ir_func.params + 2)));
+    
     Buffer.contents buf
 end
 
@@ -481,8 +489,6 @@ let () =
   let riscv_asm = List.map IRToRiscV.func_to_asm ir in
   
   (* 输出RISC-V汇编到stdout *)
-  (* 添加汇编头部 *)
-  print_endline ".text";
   (* 输出每个函数 *)
   List.iter (fun f -> 
     print_endline f
