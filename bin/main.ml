@@ -323,6 +323,43 @@ let rec expr_to_ir state expr =
       let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "sp", offset)], state'')
+  | Call (name, args) ->
+      (* 处理函数调用 *)
+      let (arg_regs, arg_codes, state') = List.fold_left (
+        fun (regs, codes, st) arg ->
+          let (reg, code, st') = expr_to_ir st arg in
+          (reg :: regs, code @ codes, st')
+      ) ([], [], state) args in
+      let arg_regs = List.rev arg_regs in
+      let arg_codes = List.rev arg_codes in
+      
+      (* 将参数移动到a0, a1, ...寄存器 *)
+      let (move_codes, state'') = List.fold_left (
+        fun (codes, st) (i, reg) ->
+          let (temp_reg, st') = 
+            if i < 8 then 
+              (RiscvReg ("a" ^ string_of_int i), st) 
+            else 
+              fresh_temp st in
+          let move_code = [Mv (temp_reg, reg)] in
+          (move_code @ codes, st')
+      ) ([], state') (List.mapi (fun i x -> (i, x)) arg_regs) in
+      
+      let move_codes = List.rev move_codes in
+      
+      (* 调用函数 *)
+      let (result_reg, state''') = fresh_temp state'' in
+      (result_reg, arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state''')
+  | Unary (op, e) ->
+      let (e_reg, e_code, state') = expr_to_ir state e in
+      let (temp, state'') = fresh_temp state' in
+      (match op with
+       | Plus -> (e_reg, e_code, state')
+       | Minus -> (temp, e_code @ [BinaryOp ("sub", temp, RiscvReg "zero", e_reg)], state'')
+       | Not -> 
+           let (ne_temp, state''') = fresh_temp state'' in
+           (temp, e_code @ [BinaryOp ("sltu", ne_temp, RiscvReg "zero", e_reg);
+                            BinaryOpImm ("xori", temp, ne_temp, 1)], state'''))
   | Binary (op, e1, e2) ->
     let (e1_reg, e1_code, state') = expr_to_ir state e1 in
     let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
