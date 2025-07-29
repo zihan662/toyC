@@ -1,6 +1,0 @@
-(executable
- (public_name ToyC_riscv)
- (name main)
- (modules main)
- (libraries ToyC_riscv_lib)
- (flags (:standard -w -32-27-26-39-8-37)))

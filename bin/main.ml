@@ -1,10 +1,68 @@
-exception LexicalError of string
+exception LexicalError of string [@@warning "-38"]
 exception SemanticError of string
 
 open ToyC_riscv_lib.Ast
 open ToyC_riscv_lib
 
 module StringMap = Map.Make(String)
+
+(* ==================== IR 定义 ==================== *)
+type reg = 
+  | RiscvReg of string  (* RISC-V寄存器如x1-x31 *)
+  | Temp of int         (* 临时变量 *)
+
+type ir_instr =
+  | Li of reg * int                (* 加载立即数 *)
+  | Mv of reg * reg                (* 寄存器间移动 *)
+  | BinaryOp of string * reg * reg * reg (* 二元运算 *)
+  | Branch of string * reg * reg * string (* 条件分支 *)
+  | Jmp of string                  (* 无条件跳转 *)
+  | Label of string                (* 标签 *)
+  | Call of string                 (* 函数调用 *)
+  | Ret                           (* 返回 *)
+  | Store of reg * reg * int       (* 存储到内存 *)
+  | Load of reg * reg * int        (* 从内存加载 *)
+
+type ir_func = {
+  name: string;
+  params: string list;
+  body: ir_instr list;
+}
+
+(* ==================== 代码生成状态 ==================== *)
+type codegen_state = {
+  temp_counter: int;
+  label_counter: int;
+  var_offset: (string, int) Hashtbl.t; (* 变量在栈帧中的偏移量 *)
+  stack_size: int; (* 当前栈帧大小 *)
+  loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
+}
+
+let initial_state = {
+  temp_counter = 0;
+  label_counter = 0;
+  var_offset = Hashtbl.create 10;
+  stack_size = 0;
+  loop_labels = [];
+}
+
+(* ==================== 辅助函数 ==================== *)
+let fresh_temp state = 
+  let temp = state.temp_counter in
+  (Temp temp, {state with temp_counter = temp + 1})
+
+let fresh_label state prefix =
+  let label = Printf.sprintf "%s%d" prefix state.label_counter in
+  (label, {state with label_counter = state.label_counter + 1})
+
+let get_var_offset state var =
+  try 
+    (Hashtbl.find state.var_offset var, state)  (* 找到时返回偏移量和原状态 *)
+  with Not_found -> 
+    let offset = state.stack_size in
+    Hashtbl.add state.var_offset var offset;
+    let new_state = {state with stack_size = offset + 8} in
+    (offset, new_state)  (* 未找到时返回新偏移量和更新后的状态 *)
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -67,11 +125,11 @@ let rec check_return_coverage stmt =
   let func_table = Hashtbl.create 30
   
   let collect_functions ast =
-    List.iter (fun fd ->
+    List.iter (fun (fd : Ast.func_def) ->
       Hashtbl.add func_table fd.name { ret_type = fd.ret_type; params = fd.params }
     ) ast
   (*检查函数调用*)
-  let rec check_expr_calls expr =
+  let rec check_expr_calls (expr : Ast.expr) =
     match expr with
     | Call (name, args) ->
         if not (Hashtbl.mem func_table name) then
@@ -221,8 +279,125 @@ let parse_channel ch =
         pos.Lexing.pos_lnum (pos.Lexing.pos_cnum - pos.Lexing.pos_bol + 1);
       exit 1
 
+(* ==================== AST到IR转换 ==================== *)
+let rec expr_to_ir state expr =
+  match expr with
+  | Num n -> 
+      let (temp, state') = fresh_temp state in
+      (temp, [Li (temp, n)], state')
+  | Var x -> 
+      let offset, state' = get_var_offset state x in
+      let (temp, state'') = fresh_temp state' in
+      (temp, [Load (temp, RiscvReg "sp", offset)], state'')
+  | Binary (op, e1, e2) ->
+      let (e1_reg, e1_code, state') = expr_to_ir state e1 in
+      let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
+      let (temp, state''') = fresh_temp state'' in
+      let op_str = match op with
+        | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
+        | Div -> "div" | Mod -> "rem" | Lt -> "slt"
+        | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
+        | Eq -> "seq" | Neq -> "sne" | And -> "and"
+        | Or -> "or" in
+      (temp, e1_code @ e2_code @ [BinaryOp (op_str, temp, e1_reg, e2_reg)], state''')
+  | _ -> failwith "Unsupported expression"
+
+let rec stmt_to_ir state stmt =
+  match stmt with
+  | BlockStmt b -> block_to_ir state b
+  | DeclStmt (_, name, Some expr) -> (* 带初始化的声明 *)
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      let offset, state'' = get_var_offset state' name in
+      (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
+  | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
+      let offset, state' = get_var_offset state name in
+      ([], state')
+  | AssignStmt (name, expr) ->
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      let offset, state'' = get_var_offset state' name in
+      (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
+  | IfStmt (cond, then_stmt, else_stmt) ->
+      let (cond_reg, cond_code, state') = expr_to_ir state cond in
+      let (then_label, state'') = fresh_label state' "then" in
+      let (else_label, state''') = fresh_label state'' "else" in
+      let (merge_label, state'''') = fresh_label state''' "merge" in
+      let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
+      let (else_code, state'''''') = 
+        match else_stmt with
+        | Some s -> stmt_to_ir state''''' s
+        | None -> ([], state''''') in
+      (cond_code @ 
+       [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+        Jmp else_label;
+        Label then_label] @
+       then_code @
+       [Jmp merge_label;
+        Label else_label] @
+       else_code @
+       [Label merge_label], state'''''')
+  | ReturnStmt (Some expr) ->
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state')
+  | ReturnStmt None ->
+      ([Ret], state)
+  | ExprStmt expr ->
+      let (_, expr_code, state') = expr_to_ir state expr in
+      (expr_code, state')
+  | WhileStmt (cond, body) ->
+      let (loop_label, state') = fresh_label state "loop" in
+      let (end_label, state'') = fresh_label state' "end" in
+      
+      let state_with_loop = { state'' with loop_labels = (end_label, loop_label) :: state''.loop_labels } in
+      
+      let (cond_reg, cond_code, state''') = expr_to_ir state_with_loop cond in
+      let (body_code, state'''') = stmt_to_ir state''' body in
+      
+      ( [Label loop_label] @
+        cond_code @
+        [Branch ("beqz", cond_reg, RiscvReg "zero", end_label)] @
+        body_code @
+        [Jmp loop_label;
+         Label end_label],
+        { state'''' with loop_labels = List.tl state''''.loop_labels } )
+  
+  | BreakStmt ->
+      (match state.loop_labels with
+       | (end_label, _) :: _ -> ([Jmp end_label], state)
+       | [] -> failwith "break statement outside loop")
+  | ContinueStmt ->
+      (match state.loop_labels with
+       | (_, loop_label) :: _ -> ([Jmp loop_label], state)
+       | [] -> failwith "continue statement outside loop")
+  | EmptyStmt ->
+      ([], state)
+
+and block_to_ir state block =
+  List.fold_left (fun (code_acc, st) stmt ->
+    let (code, st') = stmt_to_ir st stmt in
+    (code_acc @ code, st')
+  ) ([], state) block.stmts
+
+let func_to_ir (func : Ast.func_def) : ir_func =
+  let state = { 
+    initial_state with 
+    var_offset = Hashtbl.create (List.length func.params);
+  } in
+    let state' = 
+    List.fold_left (fun st (param : Ast.param) ->
+      let offset, st' = get_var_offset st param.name in
+      st'
+    ) state func.params
+  in
+  let (body_code, final_state) = block_to_ir state' func.body in
+  {
+    name = func.name;
+    params = List.map (fun (p : Ast.param) -> p.name) func.params;
+    body = body_code;
+  }
+
+
 let () =
-  let ch = open_in "test/input.toyc" in
+  let ch = open_in "test/04_while_break.tc" in
   let ast = parse_channel ch in
   close_in ch;
   semantic_analysis ast;
@@ -230,4 +405,64 @@ let () =
   let out_ch = open_out "ast.txt" in
   Printf.fprintf out_ch "%s\n" ast_str;
   close_out out_ch;
-  print_endline "Parsing successful! AST written to ast.txt";
+   let ir = List.map func_to_ir ast in  (* 转换整个AST为IR *)
+  
+  let string_of_ir ir_func =
+    let buf = Buffer.create 256 in
+    Buffer.add_string buf (Printf.sprintf "Function: %s\n" ir_func.name);
+    Buffer.add_string buf "Params: ";
+    List.iter (fun p -> Buffer.add_string buf (p ^ " ")) ir_func.params;
+    Buffer.add_string buf "\nBody:\n";
+    List.iter (fun instr ->
+      let instr_str = match instr with
+        | Li (r, n) -> Printf.sprintf "  li %s, %d" 
+                        (match r with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n) 
+                        n
+        | Mv (rd, rs) -> Printf.sprintf "  mv %s, %s" 
+                          (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+                          (match rs with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+        | BinaryOp (op, rd, rs1, rs2) ->
+            Printf.sprintf "  %s %s, %s, %s" op
+              (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (match rs1 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (match rs2 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+        | Branch (cond, rs1, rs2, label) ->
+            Printf.sprintf "  %s %s, %s, %s" cond
+              (match rs1 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              (match rs2 with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              label
+        | Jmp label ->
+            Printf.sprintf "  j %s" label
+        | Label label ->
+            label ^ ":"
+        | Call func ->
+            Printf.sprintf "  call %s" func
+        | Ret ->
+            "  ret"
+        | Store (rs, base, offset) ->
+            Printf.sprintf "  sd %s, %d(%s)"
+              (match rs with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              offset
+              (match base with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+        | Load (rd, base, offset) ->
+            Printf.sprintf "  ld %s, %d(%s)"
+              (match rd with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+              offset
+              (match base with RiscvReg s -> s | Temp n -> "t" ^ string_of_int n)
+      in
+      Buffer.add_string buf (instr_str ^ "\n")
+    ) ir_func.body;
+    Buffer.contents buf
+  in
+  
+  (* 6. 输出IR到文件 *)
+  let ir_out = open_out "risc-V.txt" in
+  List.iter (fun f -> 
+    Printf.fprintf ir_out "%s\n" (string_of_ir f)
+  ) ir;
+  close_out ir_out;
+  
+
+  print_endline "Compilation successful!";
+  print_endline ("AST written to ast.txt");
+  print_endline ("RISC-V written to risc-V.txt")

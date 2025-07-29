@@ -1,3 +1,2 @@
-Ast
-Parser
-ToyC_riscv_lib
+toyC_riscv_lib__Ast
+toyC_riscv_lib__Parser

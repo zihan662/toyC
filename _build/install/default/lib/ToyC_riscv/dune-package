@@ -1,2 +1,1 @@
-(lang dune 2.9)
-(name ToyC_riscv)
+../../../../default/ToyC_riscv.dune-package

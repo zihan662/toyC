@@ -1,4 +1,4 @@
-(lang dune 2.9)
+(lang dune 3.19)
 
 (name ToyC_riscv)
 
