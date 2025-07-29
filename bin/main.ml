@@ -37,6 +37,7 @@ type codegen_state = {
   var_offset: (string, int) Hashtbl.t; (* 变量在栈帧中的偏移量 *)
   stack_size: int; (* 当前栈帧大小 *)
   loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
+  scope_stack: (string, int) Hashtbl.t list; (* 作用域栈 *)
 }
 
 let initial_state = {
@@ -45,6 +46,7 @@ let initial_state = {
   var_offset = Hashtbl.create 10;
   stack_size = 0;
   loop_labels = [];
+  scope_stack = [];
 }
 
 (* ==================== 辅助函数 ==================== *)
@@ -56,14 +58,28 @@ let fresh_label state prefix =
   let label = Printf.sprintf "%s%d" prefix state.label_counter in
   (label, {state with label_counter = state.label_counter + 1})
 
+
 let get_var_offset state var =
-  try 
-    (Hashtbl.find state.var_offset var, state)  (* 找到时返回偏移量和原状态 *)
-  with Not_found -> 
-    let offset = state.stack_size in
-    Hashtbl.add state.var_offset var offset;
-    let new_state = {state with stack_size = offset + 8} in
-    (offset, new_state)  (* 未找到时返回新偏移量和更新后的状态 *)
+  (* 首先检查变量是否已在当前作用域中定义 *)
+  match state.scope_stack with
+  | current_scope :: _ ->
+      (try 
+         (Hashtbl.find current_scope var, state)  (* 在当前作用域找到 *)
+       with Not_found -> 
+         (* 在当前作用域添加新变量 *)
+         let offset = state.stack_size in
+         Hashtbl.add current_scope var offset;
+         let new_state = {state with stack_size = offset + 8} in
+         (offset, new_state))
+  | [] ->
+      (* 全局作用域 *)
+      (try 
+         (Hashtbl.find state.var_offset var, state)
+       with Not_found -> 
+         let offset = state.stack_size in
+         Hashtbl.add state.var_offset var offset;
+         let new_state = {state with stack_size = offset + 8} in
+         (offset, new_state))
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -337,6 +353,15 @@ let rec expr_to_ir state expr =
         (temp, code, state''''')
   | _ -> failwith "Unsupported expression"
 
+let enter_scope state =
+  let new_scope = Hashtbl.create 10 in
+  {state with scope_stack = new_scope :: state.scope_stack}
+
+let leave_scope state =
+  match state.scope_stack with
+  | [] -> state  (* 没有作用域可退出 *)
+  | _ :: rest -> {state with scope_stack = rest}
+
 let rec stmt_to_ir state stmt =
   match stmt with
   | BlockStmt b -> block_to_ir state b
@@ -407,10 +432,14 @@ let rec stmt_to_ir state stmt =
       ([], state)
 
 and block_to_ir state block =
-  List.fold_left (fun (code_acc, st) stmt ->
+  let state_with_scope = enter_scope state in
+  let (code, final_state) = List.fold_left (fun (code_acc, st) stmt ->
     let (code, st') = stmt_to_ir st stmt in
     (code_acc @ code, st')
-  ) ([], state) block.stmts
+  ) ([], state_with_scope) block.stmts in
+  let exited_state = leave_scope final_state in
+  (code, exited_state)
+
 
 let func_to_ir (func : Ast.func_def) : ir_func =
   let state = { 
