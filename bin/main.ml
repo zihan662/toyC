@@ -15,6 +15,7 @@ type ir_instr =
   | Li of reg * int                (* 加载立即数 *)
   | Mv of reg * reg                (* 寄存器间移动 *)
   | BinaryOp of string * reg * reg * reg (* 二元运算 *)
+  | BinaryOpImm of string * reg * reg * int (* 带立即数的二元运算 *)
   | Branch of string * reg * reg * string (* 条件分支 *)
   | Jmp of string                  (* 无条件跳转 *)
   | Label of string                (* 标签 *)
@@ -262,8 +263,8 @@ let semantic_analysis ast =
     check_stmt (BlockStmt fd.body) fd.ret_type false;
     scope_stack := List.tl !scope_stack
   ) ast;
-  if not !has_main then raise (SemanticError "program must contain a main function")
-  (* print_endline "Semantic analysis passed!" *)
+  if not !has_main then raise (SemanticError "program must contain a main function");
+  print_endline "Semantic analysis passed!"
 
 let parse_channel ch =
   let lex = Lexing.from_channel ch in
@@ -279,6 +280,7 @@ let parse_channel ch =
         pos.Lexing.pos_lnum (pos.Lexing.pos_cnum - pos.Lexing.pos_bol + 1);
       exit 1
 
+
 (* ==================== AST到IR转换 ==================== *)
 let rec expr_to_ir state expr =
   match expr with
@@ -290,16 +292,50 @@ let rec expr_to_ir state expr =
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "sp", offset)], state'')
   | Binary (op, e1, e2) ->
-      let (e1_reg, e1_code, state') = expr_to_ir state e1 in
-      let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
-      let (temp, state''') = fresh_temp state'' in
-      let op_str = match op with
-        | Add -> "add" | Sub -> "sub" | Mul -> "mul" 
-        | Div -> "div" | Mod -> "rem" | Lt -> "slt"
-        | Gt -> "sgt" | Leq -> "sle" | Geq -> "sge"
-        | Eq -> "seq" | Neq -> "sne" | And -> "and"
-        | Or -> "or" in
-      (temp, e1_code @ e2_code @ [BinaryOp (op_str, temp, e1_reg, e2_reg)], state''')
+    let (e1_reg, e1_code, state') = expr_to_ir state e1 in
+    let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
+    let (temp, state''') = fresh_temp state'' in
+    
+    match op with
+    | Add -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state''')
+    | Sub -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state''')
+    | Mul -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
+    | Div -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state''')
+    | Mod -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("rem", temp, e1_reg, e2_reg)], state''')
+    | Lt -> 
+        (temp, e1_code @ e2_code @ [BinaryOp ("slt", temp, e1_reg, e2_reg)], state''')
+    | Gt -> 
+        (* a > b 转换为 b < a *)
+        let code = e1_code @ e2_code @ [BinaryOp ("slt", temp, e2_reg, e1_reg)] in
+        (temp, code, state''')
+    | Leq ->
+    (* a <= b 转换为 !(b < a) *)
+    let (lt_temp, state'''') = fresh_temp state''' in
+    let code = e1_code @ e2_code @
+      [BinaryOp ("slt", lt_temp, e2_reg, e1_reg);
+       BinaryOpImm ("xori", temp, lt_temp, 1)] in
+    (temp, code, state'''')
+    | Geq ->
+        (* a >= b 转换为 !(a < b) *)
+        let (lt_temp, state'''') = fresh_temp state''' in
+        let code = e1_code @ e2_code @
+          [BinaryOp ("slt", lt_temp, e1_reg, e2_reg);
+          BinaryOpImm ("xori", temp, lt_temp, 1)] in
+        (temp, code, state'''')
+    | Eq ->
+        (* a == b 转换为 (a ^ b) == 0 *)
+        let (xor_temp, state'''') = fresh_temp state''' in
+        let (sltu_temp, state''''') = fresh_temp state'''' in
+        let code = e1_code @ e2_code @
+          [BinaryOp ("xor", xor_temp, e1_reg, e2_reg);
+          BinaryOp ("sltu", sltu_temp, RiscvReg "zero", xor_temp);
+          BinaryOpImm ("xori", temp, sltu_temp, 1)] in
+        (temp, code, state''''')
   | _ -> failwith "Unsupported expression"
 
 let rec stmt_to_ir state stmt =
@@ -414,6 +450,8 @@ module IRToRiscV = struct
         Printf.sprintf "  mv %s, %s" (reg_map rd) (reg_map rs)
     | BinaryOp (op, rd, rs1, rs2) ->
         Printf.sprintf "  %s %s, %s, %s" op (reg_map rd) (reg_map rs1) (reg_map rs2)
+    | BinaryOpImm (op, rd, rs, imm) ->
+        Printf.sprintf "  %s %s, %s, %d" op (reg_map rd) (reg_map rs) imm
     | Branch (cond, rs1, rs2, label) ->
         (match cond with
           | "beqz" -> Printf.sprintf "  beq %s, zero, %s" (reg_map rs1) label
