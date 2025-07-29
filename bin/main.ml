@@ -262,8 +262,8 @@ let semantic_analysis ast =
     check_stmt (BlockStmt fd.body) fd.ret_type false;
     scope_stack := List.tl !scope_stack
   ) ast;
-  if not !has_main then raise (SemanticError "program must contain a main function");
-  print_endline "Semantic analysis passed!"
+  if not !has_main then raise (SemanticError "program must contain a main function")
+  (* print_endline "Semantic analysis passed!" *)
 
 let parse_channel ch =
   let lex = Lexing.from_channel ch in
@@ -398,16 +398,15 @@ let func_to_ir (func : Ast.func_def) : ir_func =
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 module IRToRiscV = struct
-  (* 寄存器分配映射：将临时寄存器映射到RISC-V物理寄存器 *)
+  (* 寄存器分配映射 *)
   let reg_map = function
-    | RiscvReg s -> s  (* 保留已有的RISC-V寄存器 *)
+    | RiscvReg s -> s
     | Temp n -> 
-        (* 使用t0-t6临时寄存器，a0-a7参数寄存器 *)
         if n < 7 then Printf.sprintf "t%d" n
         else if n < 15 then Printf.sprintf "a%d" (n-7)
         else failwith "Register allocation overflow"
 
-  (* 指令转换 *)
+  (* 指令转换 - 使用sw/lw替换sd/ld *)
   let instr_to_asm = function
     | Li (r, n) -> 
         Printf.sprintf "  li %s, %d" (reg_map r) n
@@ -429,24 +428,23 @@ module IRToRiscV = struct
     | Ret ->
        "  ret"
     | Store (rs, base, offset) ->
-        Printf.sprintf "  sd %s, %d(%s)" (reg_map rs) offset (reg_map base)
+        Printf.sprintf "  sw %s, %d(%s)" (reg_map rs) offset (reg_map base)
     | Load (rd, base, offset) ->
-        Printf.sprintf "  ld %s, %d(%s)" (reg_map rd) offset (reg_map base)
+        Printf.sprintf "  lw %s, %d(%s)" (reg_map rd) offset (reg_map base)
 
-  (* 函数序言和尾声 - 修改为标准的16字节对齐栈帧 *)
-  let function_prologue name stack_size =
-    let aligned_size = if stack_size mod 16 = 0 then stack_size else ((stack_size / 16) + 1) * 16 in
+  (* 函数序言 - 使用sw *)
+  let function_prologue name =
     Printf.sprintf "%s:\n" name ^
-    "  addi sp, sp, -" ^ string_of_int aligned_size ^ "\n" ^
-    "  sd ra, " ^ string_of_int (aligned_size - 8) ^ "(sp)\n" ^
-    "  sd s0, " ^ string_of_int (aligned_size - 16) ^ "(sp)\n" ^
-    "  addi s0, sp, " ^ string_of_int aligned_size ^ "\n"
+    "  addi sp, sp, -16\n" ^
+    "  sw ra, 12(sp)\n" ^   (* ra保存在sp+12 *)
+    "  sw s0, 8(sp)\n" ^    (* s0保存在sp+8 *)
+    "  addi s0, sp, 16\n"   (* 设置帧指针 *)
 
-  let function_epilogue stack_size =
-    let aligned_size = if stack_size mod 16 = 0 then stack_size else ((stack_size / 16) + 1) * 16 in
-    "  ld ra, " ^ string_of_int (aligned_size - 8) ^ "(sp)\n" ^
-    "  ld s0, " ^ string_of_int (aligned_size - 16) ^ "(sp)\n" ^
-    "  addi sp, sp, " ^ string_of_int aligned_size ^ "\n" ^
+  (* 函数尾声 - 使用lw *)
+  let function_epilogue =
+    "  lw ra, 12(sp)\n" ^
+    "  lw s0, 8(sp)\n" ^
+    "  addi sp, sp, 16\n" ^
     "  jr ra\n"
 
   (* 转换整个IR函数 *)
@@ -454,14 +452,14 @@ module IRToRiscV = struct
     let buf = Buffer.create 256 in
     
     (* 函数头 *)
-    Buffer.add_string buf (Printf.sprintf ".globl %s\n" ir_func.name);
+    Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
     Buffer.add_string buf (Printf.sprintf ".type %s, @function\n" ir_func.name);
-    Buffer.add_string buf (function_prologue ir_func.name (8 * (List.length ir_func.params + 2)));  
+    Buffer.add_string buf (function_prologue ir_func.name);
     
-    (* 保存参数到栈帧 *)
+    (* 保存参数到栈帧 - 使用sw *)
     List.iteri (fun i param ->
-      let offset = i * 8 in
-      Buffer.add_string buf (Printf.sprintf "  sd a%d, %d(s0)\n" i offset)
+      let offset = i * 4 in  (* 32位使用4字节偏移 *)
+      Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
     (* 转换指令 *)
@@ -471,12 +469,11 @@ module IRToRiscV = struct
     
     (* 函数尾 - 只在没有ret指令时才添加 *)
     if not (List.exists (function Ret -> true | _ -> false) ir_func.body) then
-      Buffer.add_string buf (function_epilogue (8 * (List.length ir_func.params + 2)));
+      Buffer.add_string buf function_epilogue;
     
     Buffer.contents buf
 end
 
-(* 修改最后的输出部分 *)
 (* 修改最后的输出部分 *)
 let () =
   let ast = parse_channel stdin in
