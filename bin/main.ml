@@ -11,21 +11,6 @@ type reg =
   | RiscvReg of string  (* RISC-V寄存器如x1-x31 *)
   | Temp of int         (* 临时变量 *)
 
-type reg_id = int
-
-type reg_info = {
-  reg_id: reg_id;
-  first_use: int;  (* 第一次使用的位置 *)
-  last_use: int;   (* 最后一次使用的位置 *)
-  assigned_reg: string option; (* 分配的物理寄存器 *)
-}
-
-type liveness_info = {
-  reg_liveness: (reg_id, reg_info) Hashtbl.t;
-  instr_count: int;
-}[@@ocaml.warning "-69"]
-
-
 type ir_instr =
   | Li of reg * int                (* 加载立即数 *)
   | Mv of reg * reg                (* 寄存器间移动 *)
@@ -341,146 +326,6 @@ let parse_channel ch =
 
 
 (* ==================== AST到IR转换 ==================== *)
-(* 分析 IR 指令中的寄存器使用情况 *)
-let analyze_reg_usage instrs =
-  let reg_liveness = Hashtbl.create 50 in
-  let instr_count = ref 0 in
-  
-  (* 更新寄存器的活跃信息 *)
-  let update_reg_liveness reg_id instr_index =
-    if Hashtbl.mem reg_liveness reg_id then
-      let info = Hashtbl.find reg_liveness reg_id in
-      Hashtbl.replace reg_liveness reg_id {info with last_use = instr_index}
-    else
-      let info = {
-        reg_id = reg_id;
-        first_use = instr_index;
-        last_use = instr_index;
-        assigned_reg: string option = None;
-      } in
-      Hashtbl.add reg_liveness reg_id info
-  in
-  
-  (* 遍历所有指令，分析寄存器使用 *)
-  List.iter (fun instr ->
-    let idx = !instr_count in
-    incr instr_count;
-    
-    match instr with
-    | Li (reg, _) ->
-        (match reg with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | Mv (rd, rs) ->
-        (match rd with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match rs with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | BinaryOp (_, rd, rs1, rs2) ->
-        (match rd with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match rs1 with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match rs2 with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | BinaryOpImm (_, rd, rs, _) ->
-        (match rd with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match rs with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | Branch (_, rs1, rs2, _) ->
-        (match rs1 with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match rs2 with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | Store (rs, base, _) ->
-        (match rs with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match base with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | Load (rd, base, _) ->
-        (match rd with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ());
-        (match base with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | ReloadVar (reg, _) ->
-        (match reg with
-         | Temp id -> update_reg_liveness id idx
-         | _ -> ())
-    | _ -> ()
-  ) instrs;
-  
-  { reg_liveness; instr_count = !instr_count }
-
-(* 基于生命周期分析的寄存器分配 *)
-let allocate_registers liveness_info =
-  let physical_regs = [
-    "t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6";  (* 7个临时寄存器 *)
-    "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7"; (* 8个参数寄存器 *)
-    "s0"; "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; 
-    "s8"; "s9"; "s10"; "s11"; (* 12个保存寄存器 *)
-  ] in
-  
-  let reg_mapping = Hashtbl.create 50 in
-  let used_regs = Hashtbl.create 27 in (* 跟踪当前使用的物理寄存器 *)
-  
-  (* 将寄存器信息转换为列表并按首次使用排序 *)
-  let reg_list = Hashtbl.fold (fun _ info acc -> info :: acc) liveness_info.reg_liveness [] in
-  let sorted_regs = List.sort (fun a b -> compare a.first_use b.first_use) reg_list in
-  
-  (* 检查寄存器在指定时间是否空闲 *)
-  let is_reg_free reg_name start_time end_time =
-    not (Hashtbl.mem used_regs reg_name) ||
-    let conflict = Hashtbl.fold (fun temp_id reg_info has_conflict ->
-      if has_conflict then true
-      else if reg_info.assigned_reg = Some reg_name then
-        not (reg_info.last_use < start_time || reg_info.first_use > end_time)
-      else false
-    ) reg_mapping false in
-    not conflict
-  in
-  
-  (* 为每个虚拟寄存器分配物理寄存器 *)
-  List.iter (fun reg_info ->
-    (* 寻找可用的物理寄存器 *)
-    let assigned_reg = ref None in
-    
-    (* 首先尝试找一个完全不冲突的寄存器 *)
-    List.iter (fun phys_reg ->
-      if !assigned_reg = None && is_reg_free phys_reg reg_info.first_use reg_info.last_use then
-        assigned_reg := Some phys_reg
-    ) physical_regs;
-    
-    (* 如果没找到完全不冲突的，尝试找一个可以重叠使用的寄存器 *)
-    if !assigned_reg = None then (
-      List.iter (fun phys_reg ->
-        if !assigned_reg = None then
-          assigned_reg := Some phys_reg
-      ) physical_regs
-    );
-    
-    match !assigned_reg with
-    | Some reg_name ->
-        Hashtbl.add reg_mapping reg_info.reg_id {reg_info with assigned_reg = Some reg_name};
-        Hashtbl.replace used_regs reg_name true
-    | None ->
-        failwith "无法为寄存器分配物理寄存器"
-  ) sorted_regs;
-  
-  reg_mapping
 let rec expr_to_ir state expr =
   match expr with
   | Num n -> 
@@ -732,26 +577,13 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 module IRToRiscV = struct
-  (* 寄存器映射 *)
-  let reg_alloc_map = ref (Hashtbl.create 0)
-  
-  let set_reg_allocation map =
-    reg_alloc_map := map
-  
+  (* 寄存器分配映射 *)
   let reg_map = function
     | RiscvReg s -> s
     | Temp n -> 
-        try
-          let reg_info = Hashtbl.find !reg_alloc_map n in
-          match reg_info.assigned_reg with
-          | Some reg -> reg
-          | None -> failwith ("寄存器 " ^ string_of_int n ^ " 未分配物理寄存器")
-        with Not_found ->
-          (* 后备方案：使用原有映射 *)
-          if n < 7 then Printf.sprintf "t%d" n
-          else if n < 15 then Printf.sprintf "a%d" (n-7)
-          else if n < 27 then Printf.sprintf "s%d" (n-15)
-          else Printf.sprintf "t%d" ((n-27) mod 7)
+        if n < 7 then Printf.sprintf "t%d" n
+        else if n < 15 then Printf.sprintf "a%d" (n-7)
+        else failwith "Register allocation overflow"
 
   (* 指令转换 - 使用sw/lw替换sd/ld，添加frame_size参数 *)
   let instr_to_asm var_offsets frame_size = function
@@ -844,11 +676,6 @@ module IRToRiscV = struct
 
   (* 转换整个IR函数 *)
   let func_to_asm var_offsets (ir_func : ir_func) =
-    (* 进行寄存器生命周期分析和分配 *)
-    let liveness_info = analyze_reg_usage ir_func.body in
-    let reg_allocation = allocate_registers liveness_info in
-    set_reg_allocation reg_allocation;
-    
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
     
@@ -878,6 +705,7 @@ module IRToRiscV = struct
     
     Buffer.contents buf
 end
+
 (* 修改最后的输出部分 *)
 let () =
   (* 从标准输入读取 *)
