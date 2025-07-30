@@ -23,7 +23,7 @@ type ir_instr =
   | Ret                           (* 返回 *)
   | Store of reg * reg * int       (* 存储到内存 *)
   | Load of reg * reg * int        (* 从内存加载 *)
-
+  | ReloadVar of reg * string      (* 在函数调用后重新加载变量 *)
 type ir_func = {
   name: string;
   params: string list;
@@ -374,7 +374,7 @@ let rec expr_to_ir state expr =
            let (ne_temp, state''') = fresh_temp state'' in
            (temp, e_code @ [BinaryOp ("sltu", ne_temp, RiscvReg "zero", e_reg);
                             BinaryOpImm ("xori", temp, ne_temp, 1)], state'''))
-  | Binary (op, e1, e2) ->
+    | Binary (op, e1, e2) ->
     let (e1_reg, e1_code, state') = expr_to_ir state e1 in
     let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
     let (temp, state''') = fresh_temp state'' in
@@ -389,7 +389,19 @@ let rec expr_to_ir state expr =
       | _ -> 
           (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state'''))
     | Mul -> 
-        (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
+        (* 检查e1和e2中是否有函数调用 *)
+        let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
+        let e2_has_call = List.exists (function Call _ -> true | _ -> false) e2_code in
+        
+        (match (e1, e2) with
+        | (Var x1, _) when e2_has_call -> 
+            (* 如果左侧是变量，右侧包含函数调用 *)
+            (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
+        | (_, Var x2) when e1_has_call -> 
+            (* 如果右侧是变量，左侧包含函数调用 *)
+            (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
+        | _ -> 
+            (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state'''))
     | Div -> 
         (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state''')
     | Mod -> 
@@ -513,7 +525,7 @@ and block_to_ir state block =
   (code, exited_state)
 
 
-let func_to_ir (func : Ast.func_def) : ir_func =
+let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
@@ -532,25 +544,21 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     name = func.name;
     params = List.map (fun (p : Ast.param) -> p.name) func.params;
     body = body_code;
-  }
+  }, final_state.var_offset
 
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 module IRToRiscV = struct
   (* 寄存器分配映射 *)
-    let reg_map = function
+  let reg_map = function
     | RiscvReg s -> s
     | Temp n -> 
-        (* 优先使用a系列寄存器（避开a0, a1用于参数） *)
-        if n < 6 then 
-          Printf.sprintf "a%d" (n + 2)  (* a2, a3, a4, a5, a6, a7 *)
-        else if n < 13 then
-          Printf.sprintf "t%d" (n - 6)  (* t0, t1, t2, t3, t4, t5, t6 *)
-        else 
-          failwith "Register allocation overflow"
+        if n < 7 then Printf.sprintf "t%d" n
+        else if n < 15 then Printf.sprintf "a%d" (n-7)
+        else failwith "Register allocation overflow"
 
   (* 指令转换 - 使用sw/lw替换sd/ld，添加frame_size参数 *)
-  let instr_to_asm frame_size = function
+  let instr_to_asm var_offsets frame_size = function
     | Li (r, n) -> 
         Printf.sprintf "  li %s, %d" (reg_map r) n
     | Mv (rd, rs) ->
@@ -581,6 +589,13 @@ module IRToRiscV = struct
         Printf.sprintf "  sw %s, %d(%s)" (reg_map rs) offset (reg_map base)
     | Load (rd, base, offset) ->
         Printf.sprintf "  lw %s, %d(%s)" (reg_map rd) offset (reg_map base)
+    | ReloadVar (reg, var_name) ->
+        (* 查找变量在栈帧中的偏移量并生成加载指令 *)
+        (try
+          let offset = Hashtbl.find var_offsets var_name in
+          Printf.sprintf "  lw %s, %d(s0)" (reg_map reg) offset
+        with Not_found ->
+          failwith ("Variable " ^ var_name ^ " not found during code generation"))
 
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
@@ -632,7 +647,7 @@ module IRToRiscV = struct
     "  ret\n"  (* 使用ret而不是jr ra *)
 
   (* 转换整个IR函数 *)
-  let func_to_asm (ir_func : ir_func) =
+  let func_to_asm var_offsets (ir_func : ir_func) =
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
     
@@ -647,9 +662,9 @@ module IRToRiscV = struct
       Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
-    (* 转换指令，传入frame_size参数 *)
+    (* 转换指令，传入var_offsets和frame_size参数 *)
     List.iter (fun instr ->
-      Buffer.add_string buf (instr_to_asm frame_size instr ^ "\n")
+      Buffer.add_string buf (instr_to_asm var_offsets frame_size instr ^ "\n")
     ) ir_func.body;
     
     (* 检查是否已经有显式的返回指令 *)
@@ -662,23 +677,40 @@ module IRToRiscV = struct
     
     Buffer.contents buf
 end
-
 (* 修改最后的输出部分 *)
 let () =
+  (* 从标准输入读取 *)
   let ast = parse_channel stdin in
   semantic_analysis ast;
   
+  (* 输出AST到标准输出 *)
+  let ast_str = string_of_ast ast in
+  Printf.printf "%s\n" ast_str;
+  
   (* 转换为IR *)
-  let ir = List.map func_to_ir ast in
+  let ir_with_offsets = List.map func_to_ir ast in
+  
+  (* 分离IR函数和变量偏移量表 *)
+  let (ir_funcs, var_offsets_list) = List.split ir_with_offsets in
+  
+  (* 创建一个合并的变量偏移量表 *)
+  let combined_var_offsets = Hashtbl.create 50 in
+  List.iter (fun var_offsets ->
+    Hashtbl.iter (fun name offset ->
+      Hashtbl.add combined_var_offsets name offset
+    ) var_offsets
+  ) var_offsets_list;
   
   (* 转换为RISC-V汇编 *)
-  let riscv_asm = List.map IRToRiscV.func_to_asm ir in
-  print_endline ".global main";
-  (* 输出RISC-V汇编到stdout *)
+  let riscv_asm = List.map (IRToRiscV.func_to_asm combined_var_offsets) ir_funcs in
+  
+  (* 输出RISC-V汇编到标准输出 *)
+  (* 添加汇编头部 *)
+  Printf.printf ".global main\n";
   (* 输出每个函数 *)
   List.iter (fun f -> 
-    print_endline f
+    Printf.printf "%s\n" f
   ) riscv_asm;
   
-  (* 错误信息输出到stderr *)
-  prerr_endline "Compilation successful!"
+  (* 完成提示到标准错误 *)
+  prerr_endline "Compilation successful!";
