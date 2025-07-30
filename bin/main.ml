@@ -604,7 +604,7 @@ module IRToRiscV = struct
     Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
     "  ret\n"  (* 使用ret而不是jr ra *)
 
-  (* 转换整个IR函数 *)
+    (* 转换整个IR函数 *)
   let func_to_asm (ir_func : ir_func) =
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
@@ -625,10 +625,18 @@ module IRToRiscV = struct
       Buffer.add_string buf (instr_to_asm instr ^ "\n")
     ) ir_func.body;
     
-    (* 只有当函数体中没有显式的返回指令时才添加函数尾声 *)
-    let has_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
-    if not has_return then
+    (* 检查是否已经有显式的返回指令 *)
+    let has_explicit_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
+    
+    (* 只有在没有显式返回时才添加函数尾声 *)
+    if not has_explicit_return then (
+      (* 对于main函数，添加模256处理 *)
+      if ir_func.name = "main" then (
+        Buffer.add_string buf "  andi a0, a0, 255\n";
+      );
+      (* 添加函数尾声 *)
       Buffer.add_string buf (function_epilogue frame_size);
+    );
     
     Buffer.contents buf
 end
