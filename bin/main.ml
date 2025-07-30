@@ -335,31 +335,29 @@ let rec expr_to_ir state expr =
       let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
+  (* 在 expr_to_ir 函数的 Call 分支中 *)
   | Call (name, args) ->
-    (* 按正确顺序处理参数 *)
+    (* 处理参数 *)
     let (processed_args, final_state) = List.fold_left (
       fun (acc_results, acc_state) arg_expr ->
         let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
         ((reg, code) :: acc_results, new_state)
     ) ([], state) args in
     
-    (* 保持参数顺序 *)
     let ordered_args = List.rev processed_args in
-    
-    (* 分离寄存器和代码 *)
     let (arg_regs, arg_code_lists) = List.split ordered_args in
     let all_arg_codes = List.flatten arg_code_lists in
     
-    (* 释放参数寄存器，因为它们即将被移动到a寄存器 *)
     let state_after_free = List.fold_left (fun st reg -> free_temp st reg) final_state arg_regs in
     
-    (* 生成参数移动指令 *)
+    (* 修改这里：正确处理超过8个参数 *)
     let move_instructions = List.mapi (
       fun i reg ->
         if i < 8 then
           [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
         else
-          []
+          (* 超过8个的参数需要压栈 *)
+          [Store (reg, RiscvReg "sp", -(4 * (i - 8)))]  (* 简化的栈存储 *)
     ) arg_regs in
     
     let move_codes = List.flatten move_instructions in
@@ -588,7 +586,7 @@ module IRToRiscV = struct
           Printf.sprintf "a%d" (n - 7)
         else
           (* 当寄存器不足时，使用栈空间 *)
-          let stack_offset = -(20 + (n * 4)) in
+          let stack_offset = -(frame_size - 4 - (n * 4)) in
           Printf.sprintf "%d(sp)" stack_offset
 
   (* 修改instr_to_asm函数以处理栈访问 *)
@@ -739,12 +737,13 @@ module IRToRiscV = struct
         | _ -> 
             Printf.sprintf "  lw %s, %d(%s)" 
               (reg_map var_offsets frame_size rd) offset (reg_map var_offsets frame_size base))
+    (* 修改 ReloadVar 处理 *)
     | ReloadVar (reg, var_name) ->
         (try
           let offset = Hashtbl.find var_offsets var_name in
           (match reg with
-          | Temp n when n >= 15 -> 
-              let stack_offset = -(20 + (n * 4)) in
+          | Temp n when n >= 7 -> 
+              let stack_offset = -(frame_size - 4 - (n * 4)) in
               Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(sp)" offset stack_offset
           | _ -> 
               Printf.sprintf "  lw %s, %d(s0)" (reg_map var_offsets frame_size reg) offset)
@@ -772,15 +771,8 @@ module IRToRiscV = struct
     (* 参数需要的空间: 参数数量 * 4字节 *)
     let param_size = List.length ir_func.params * 4 in
     
-    (* 计算局部变量需要的空间 *)
-    let local_var_count = ref 0 in
-    let max_temp_reg = ref (-1) in
-    List.iter (function
-      | Store _ -> incr local_var_count
-      | _ -> ()
-    ) ir_func.body;
-    
     (* 计算最大临时寄存器编号 *)
+    let max_temp_reg = ref (-1) in
     let update_max_temp instr =
       let check_reg = function
         | Temp n -> max_temp_reg := max !max_temp_reg n
@@ -795,20 +787,17 @@ module IRToRiscV = struct
     in
     List.iter update_max_temp ir_func.body;
     
-    let local_size = !local_var_count * 4 in
-    let temp_stack_size = if !max_temp_reg >= 15 then (!max_temp_reg - 14) * 4 else 0 in
+    (* 为临时寄存器预留栈空间 *)
+    let temp_stack_size = if !max_temp_reg >= 7 then (!max_temp_reg - 6) * 4 else 0 in
     
-    (* 考虑局部变量的偏移量分配方式：从-20开始 *)
-    let max_local_offset = if !local_var_count > 0 then 20 + (!local_var_count - 1) * 4 else 0 in
-    
-    (* 确保栈帧足够大以容纳最大偏移量和临时变量 *)
-    let required_stack_size = max (max_local_offset + temp_stack_size + 4) (base_size + param_size + local_size + temp_stack_size) in
+    (* 确保栈帧足够大 *)
+    let required_stack_size = base_size + param_size + temp_stack_size in
     
     (* 向上取整到16的倍数 *)
     let aligned_size = ((required_stack_size + 15) / 16) * 16 in
     
     (* 确保最小栈帧大小 *)
-    max aligned_size 32
+    max aligned_size 16
 
   (* 函数序言 - 动态计算栈帧大小 *)
   let function_prologue name frame_size =
@@ -834,15 +823,17 @@ module IRToRiscV = struct
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
     
-     (* 函数头 *)
-    (* Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
-    Buffer.add_string buf (Printf.sprintf ".type %s, @function\n" ir_func.name); *)
     Buffer.add_string buf (function_prologue ir_func.name frame_size);
       
     (* 保存参数到栈帧 - 使用负偏移量 *)
     List.iteri (fun i param ->
       let offset = -(20 + i * 4) in
-      Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
+      if i < 8 then
+        (* 前8个参数从a0-a7寄存器加载 *)
+        Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
+      else
+        (* 超过8个的参数已经在调用时通过栈传递，这里只需要注释 *)
+        Buffer.add_string buf (Printf.sprintf "  # 参数%d (%s) 已通过栈传递到偏移量 %d(s0)\n" i param offset)
     ) ir_func.params;
     
     (* 转换指令，传入var_offsets和frame_size参数 *)
