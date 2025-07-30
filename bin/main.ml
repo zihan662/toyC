@@ -86,9 +86,8 @@ let get_var_offset_for_use state var =
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      (* 为局部变量预留独立的负偏移量空间，从-20开始 *)
-      (* 这样可以避免与参数(-4, -8, ...)冲突 *)
-      let offset = -(20 + state.stack_size) in
+      (* 为局部变量预留独立的负偏移量空间，避免与参数(-20, -24, ...)冲突 *)
+      let offset = -(20 + state.stack_size) in  
       Hashtbl.add current_scope var offset;
       let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
@@ -512,10 +511,11 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
   } in
-    (* 为参数设置固定的偏移量，使用负偏移量与存储一致 *)
+    (* 为参数设置固定的偏移量，使用负偏移量与标准代码一致 *)
     let state' = 
     List.fold_left (fun st (i, (param : Ast.param)) ->
-      let offset = -(i + 1) * 4 in  (* 参数偏移量: -4, -8, -12, ... *)
+      (* 使用与标准代码相同的参数偏移量 *)
+      let offset = -(20 + i * 4) in  (* 参数偏移量: -20, -24, -28, ... *)
       Hashtbl.add st.var_offset param.name offset;
       st
     ) state (List.mapi (fun i x -> (i, x)) func.params)
@@ -625,12 +625,14 @@ module IRToRiscV = struct
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
     
-    (* 函数序言 *)
+     (* 函数头 *)
+    (* Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
+    Buffer.add_string buf (Printf.sprintf ".type %s, @function\n" ir_func.name); *)
     Buffer.add_string buf (function_prologue ir_func.name frame_size);
-    
+      
     (* 保存参数到栈帧 - 使用负偏移量 *)
     List.iteri (fun i param ->
-      let offset = -(i + 1) * 4 in
+      let offset = -(20 + i * 4) in
       Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
