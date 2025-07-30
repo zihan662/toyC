@@ -298,8 +298,7 @@ let semantic_analysis ast =
     check_stmt (BlockStmt fd.body) fd.ret_type false;
     scope_stack := List.tl !scope_stack
   ) ast;
-  if not !has_main then raise (SemanticError "program must contain a main function");
-  print_endline "Semantic analysis passed!"
+  if not !has_main then raise (SemanticError "program must contain a main function")
 
 let parse_channel ch =
   let lex = Lexing.from_channel ch in
