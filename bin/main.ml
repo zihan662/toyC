@@ -449,24 +449,63 @@ let rec stmt_to_ir state stmt =
       let offset, state'' = get_var_offset_for_use state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
   | IfStmt (cond, then_stmt, else_stmt_opt) ->
-      let (cond_reg, cond_code, state') = expr_to_ir state cond in
-      let (then_label, state'') = fresh_label state' "then" in
-      let (else_label, state''') = fresh_label state'' "else" in
-      let (merge_label, state'''') = fresh_label state''' "merge" in
-      let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
-      let (else_code, state'''''') = 
-        match else_stmt_opt with
-        | Some s -> stmt_to_ir state''''' s
-        | None -> ([], state''''') in
+    let (cond_reg, cond_code, state') = expr_to_ir state cond in
+    let (then_label, state'') = fresh_label state' "then" in
+    let (else_label, state''') = fresh_label state'' "else" in
+    let (merge_label, state'''') = fresh_label state''' "merge" in
+    let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
+    let (else_code, state'''''') = 
+      match else_stmt_opt with
+      | Some s -> stmt_to_ir state''''' s
+      | None -> ([], state''''') in
+    
+    (* 检查分支是否以return结尾 *)
+    let ends_with_return code = 
+      match List.rev code with
+      | Ret :: _ -> true
+      | _ -> false
+    in
+    
+    let then_returns = ends_with_return then_code in
+    let else_returns = ends_with_return else_code in
+    
+    if then_returns && else_returns then
+      (* 两个分支都返回，不需要merge标签 *)
       (cond_code @ 
-       [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
         Jmp else_label;
         Label then_label] @
-       then_code @
-       [Jmp merge_label;
+      then_code @
+      [Label else_label] @
+      else_code, state'''''')
+    else if then_returns then
+      (* 只有then分支返回 *)
+      (cond_code @ 
+      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
         Label else_label] @
-       else_code @
-       [Label merge_label], state'''''')
+      else_code @
+      [Label then_label] @
+      then_code, state'''''')
+    else if else_returns then
+      (* 只有else分支返回 *)
+      (cond_code @ 
+      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+        Jmp else_label;
+        Label then_label] @
+      then_code @
+      [Label else_label] @
+      else_code, state'''''')
+    else
+      (* 一般情况 *)
+      (cond_code @ 
+      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+        Jmp else_label;
+        Label then_label] @
+      then_code @
+      [Jmp merge_label;
+        Label else_label] @
+      else_code @
+      [Label merge_label], state'''''')
   | ReturnStmt (Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state')
