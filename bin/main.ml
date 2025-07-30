@@ -502,10 +502,10 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
   } in
-    (* 为参数设置固定的偏移量，不增加stack_size *)
+    (* 为参数设置固定的偏移量，使用负偏移量与存储一致 *)
     let state' = 
     List.fold_left (fun st (i, (param : Ast.param)) ->
-      let offset = i * 4 in  (* 参数偏移量: 0, 4, 8, ... *)
+      let offset = -(i + 1) * 4 in  (* 参数偏移量: -4, -8, -12, ... *)
       Hashtbl.add st.var_offset param.name offset;
       st
     ) state (List.mapi (fun i x -> (i, x)) func.params)
@@ -556,33 +556,46 @@ module IRToRiscV = struct
     | Load (rd, base, offset) ->
         Printf.sprintf "  lw %s, %d(%s)" (reg_map rd) offset (reg_map base)
 
-  (* 函数序言 - 使用sw *)
-  let function_prologue name =
-    Printf.sprintf "%s:\n" name ^
-    "  addi sp, sp, -16\n" ^
-    "  sw ra, 12(sp)\n" ^   (* ra保存在sp+12 *)
-    "  sw s0, 8(sp)\n" ^    (* s0保存在sp+8 *)
-    "  addi s0, sp, 16\n"   (* 设置帧指针 *)
+  (* 计算函数需要的栈帧大小 *)
+  let calculate_frame_size (ir_func : ir_func) =
+    (* 基础栈帧大小：保存 ra(4字节) + s0(4字节) = 8字节 *)
+    (* 加上参数和局部变量需要的空间 *)
+    let param_size = List.length ir_func.params * 4 in
+    (* 为了简单起见，我们分配32字节栈帧，这足够大多数情况 *)
+    32
 
-  (* 函数尾声 - 使用lw *)
-  let function_epilogue =
-    "  lw ra, 12(sp)\n" ^
-    "  lw s0, 8(sp)\n" ^
-    "  addi sp, sp, 16\n" ^
+  (* 函数序言 - 动态计算栈帧大小 *)
+  let function_prologue name frame_size =
+    let ra_offset = frame_size - 4 in      (* ra保存在栈帧顶部 *)
+    let s0_offset = frame_size - 8 in      (* s0保存在ra下方 *)
+    Printf.sprintf "%s:\n" name ^
+    Printf.sprintf "  addi sp, sp, -%d\n" frame_size ^
+    Printf.sprintf "  sw ra, %d(sp)\n" ra_offset ^
+    Printf.sprintf "  sw s0, %d(sp)\n" s0_offset ^
+    Printf.sprintf "  addi s0, sp, %d\n" frame_size
+
+  (* 函数尾声 *)
+  let function_epilogue frame_size =
+    let ra_offset = frame_size - 4 in 
+    let s0_offset = frame_size - 8 in 
+    Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
+    Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
+    Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
     "  jr ra\n"
 
   (* 转换整个IR函数 *)
-  let func_to_asm ir_func =
+  let func_to_asm (ir_func : ir_func) =
     let buf = Buffer.create 256 in
+    let frame_size = calculate_frame_size ir_func in
     
     (* 函数头 *)
     Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
     Buffer.add_string buf (Printf.sprintf ".type %s, @function\n" ir_func.name);
-    Buffer.add_string buf (function_prologue ir_func.name);
+    Buffer.add_string buf (function_prologue ir_func.name frame_size);
     
-    (* 保存参数到栈帧 - 使用sw *)
+    (* 保存参数到栈帧 - 使用负偏移量 *)
     List.iteri (fun i param ->
-      let offset = i * 4 in  (* 32位使用4字节偏移 *)
+      let offset = -(i + 1) * 4 in  (* 使用负偏移量: -4, -8, -12, ... *)
       Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
@@ -591,9 +604,9 @@ module IRToRiscV = struct
       Buffer.add_string buf (instr_to_asm instr ^ "\n")
     ) ir_func.body;
     
-    (* 函数尾 - 只在没有ret指令时才添加 *)
+    (* 函数尾 *)
     if not (List.exists (function Ret -> true | _ -> false) ir_func.body) then
-      Buffer.add_string buf function_epilogue;
+      Buffer.add_string buf (function_epilogue frame_size);
     
     Buffer.contents buf
 end
