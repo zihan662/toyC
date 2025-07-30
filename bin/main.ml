@@ -84,20 +84,19 @@ let get_var_offset_for_use state var =
          (* 变量不存在，这应该是错误情况 *)
          failwith ("Variable " ^ var ^ " not found"))
 let get_var_offset_for_declaration state var =
-  (* 变量声明时，只在当前作用域创建变量 *)
   match state.scope_stack with
   | current_scope :: _ ->
-      let offset = state.stack_size in
+      (* 为局部变量预留独立的负偏移量空间，从-20开始 *)
+      (* 这样可以避免与参数(-4, -8, ...)冲突 *)
+      let offset = -(20 + state.stack_size) in
       Hashtbl.add current_scope var offset;
-      let new_state = {state with stack_size = offset + 8} in
+      let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
   | [] ->
-      (* 在全局作用域中创建变量 *)
       let offset = state.stack_size in
       Hashtbl.add state.var_offset var offset;
-      let new_state = {state with stack_size = offset + 8} in
+      let new_state = {state with stack_size = offset + 4} in
       (offset, new_state)
-
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -559,10 +558,32 @@ module IRToRiscV = struct
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
     (* 基础栈帧大小：保存 ra(4字节) + s0(4字节) = 8字节 *)
-    (* 加上参数和局部变量需要的空间 *)
+    let base_size = 8 in
+    
+    (* 参数需要的空间: 参数数量 * 4字节 *)
     let param_size = List.length ir_func.params * 4 in
-    (* 为了简单起见，我们分配32字节栈帧，这足够大多数情况 *)
-    32
+    
+    (* 计算局部变量需要的空间 *)
+    let local_var_count = ref 0 in
+    List.iter (function
+      | Store _ -> incr local_var_count
+      | _ -> ()
+    ) ir_func.body;
+    
+    let local_size = !local_var_count * 4 in
+    
+    (* 考虑局部变量的偏移量分配方式：从-20开始 *)
+    (* 最大局部变量偏移量绝对值: 20 + (local_var_count-1)*4 *)
+    let max_local_offset = if !local_var_count > 0 then 20 + (!local_var_count - 1) * 4 else 0 in
+    
+    (* 确保栈帧足够大以容纳最大偏移量 *)
+    let required_stack_size = max (max_local_offset + 4) (base_size + param_size + local_size) in
+    
+    (* 向上取整到16的倍数 *)
+    let aligned_size = ((required_stack_size + 15) / 16) * 16 in
+    
+    (* 确保最小栈帧大小 *)
+    max aligned_size 32
 
   (* 函数序言 - 动态计算栈帧大小 *)
   let function_prologue name frame_size =
@@ -581,7 +602,7 @@ module IRToRiscV = struct
     Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
     Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
     Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
-    "  jr ra\n"
+    "  ret\n"  (* 使用ret而不是jr ra *)
 
   (* 转换整个IR函数 *)
   let func_to_asm (ir_func : ir_func) =
@@ -595,7 +616,7 @@ module IRToRiscV = struct
     
     (* 保存参数到栈帧 - 使用负偏移量 *)
     List.iteri (fun i param ->
-      let offset = -(i + 1) * 4 in  (* 使用负偏移量: -4, -8, -12, ... *)
+      let offset = -(i + 1) * 4 in
       Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
@@ -604,8 +625,9 @@ module IRToRiscV = struct
       Buffer.add_string buf (instr_to_asm instr ^ "\n")
     ) ir_func.body;
     
-    (* 函数尾 *)
-    if not (List.exists (function Ret -> true | _ -> false) ir_func.body) then
+    (* 只有当函数体中没有显式的返回指令时才添加函数尾声 *)
+    let has_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
+    if not has_return then
       Buffer.add_string buf (function_epilogue frame_size);
     
     Buffer.contents buf
