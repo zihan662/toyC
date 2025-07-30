@@ -683,10 +683,6 @@ let () =
   let ast = parse_channel stdin in
   semantic_analysis ast;
   
-  (* 输出AST到标准输出 *)
-  let ast_str = string_of_ast ast in
-  Printf.printf "%s\n" ast_str;
-  
   (* 转换为IR *)
   let ir_with_offsets = List.map func_to_ir ast in
   
@@ -704,7 +700,7 @@ let () =
   (* 转换为RISC-V汇编 *)
   let riscv_asm = List.map (IRToRiscV.func_to_asm combined_var_offsets) ir_funcs in
   
-  (* 输出RISC-V汇编到标准输出 *)
+  (* 只输出RISC-V汇编到标准输出 *)
   (* 添加汇编头部 *)
   Printf.printf ".global main\n";
   (* 输出每个函数 *)
