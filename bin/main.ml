@@ -348,9 +348,20 @@ let rec expr_to_ir state expr =
       
       let move_codes = List.rev move_codes in
       
-      (* 调用函数 *)
-      let (result_reg, state''') = fresh_temp state'' in
-      (result_reg, arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state''')
+       let is_void_func = 
+        try
+          let func_info = Hashtbl.find func_table name in
+          func_info.ret_type = Void
+        with Not_found -> false
+      in
+      if is_void_func then
+        (* void函数调用，不关心返回值 *)
+        let (temp, state''') = fresh_temp state'' in
+        (temp, arg_codes @ move_codes @ [Call name; Li (temp, 0)], state''')
+      else
+        (* 非void函数调用，需要处理返回值 *)
+        let (result_reg, state''') = fresh_temp state'' in
+        (result_reg, arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state''')
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
       let (temp, state'') = fresh_temp state' in
@@ -549,7 +560,7 @@ module IRToRiscV = struct
     | Call func ->
        "  call " ^ func
     | Ret ->
-       "  ret"
+       "  jr ra"
     | Store (rs, base, offset) ->
         Printf.sprintf "  sw %s, %d(%s)" (reg_map rs) offset (reg_map base)
     | Load (rd, base, offset) ->
@@ -628,14 +639,21 @@ module IRToRiscV = struct
     (* 检查是否已经有显式的返回指令 *)
     let has_explicit_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
     
-    (* 只有在没有显式返回时才添加函数尾声 *)
+    (* 添加栈恢复代码（除了ret指令） *)
+    let ra_offset = frame_size - 4 in 
+    let s0_offset = frame_size - 8 in 
+    Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_offset);
+    Buffer.add_string buf (Printf.sprintf "  lw s0, %d(sp)\n" s0_offset);
+    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" frame_size);
+    
+    (* 对于main函数，添加模256处理 *)
+    if ir_func.name = "main" then (
+      Buffer.add_string buf "  andi a0, a0, 255\n";
+    );
+    
+    (* 只有在没有显式返回时才添加返回指令 *)
     if not has_explicit_return then (
-      (* 对于main函数，添加模256处理 *)
-      if ir_func.name = "main" then (
-        Buffer.add_string buf "  andi a0, a0, 255\n";
-      );
-      (* 添加函数尾声 *)
-      Buffer.add_string buf (function_epilogue frame_size);
+      Buffer.add_string buf "  jr ra\n";
     );
     
     Buffer.contents buf
