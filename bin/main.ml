@@ -401,8 +401,7 @@ let rec expr_to_ir state expr =
     | Sub -> 
       (match e2 with
       | Num n -> 
-          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], 
-           free_temp state''' e1_reg) (* 释放e1_reg *)
+          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final)
       | _ -> 
           (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
     | Mul -> 
