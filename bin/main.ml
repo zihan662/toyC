@@ -336,31 +336,26 @@ let rec expr_to_ir state expr =
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
   (* 在 expr_to_ir 函数的 Call 分支中 *)
+  (* 修改 expr_to_ir 函数中 Call 分支 *)
   | Call (name, args) ->
+    (* 使用索引处理参数 *)
+    let indexed_args = List.mapi (fun i arg -> (i, arg)) args in
+    
     (* 处理参数 *)
     let (processed_args, final_state) = List.fold_left (
-      fun (acc_results, acc_state) arg_expr ->
+      fun (acc_results, acc_state) (i, arg_expr) ->
         let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
-        ((reg, code) :: acc_results, new_state)
-    ) ([], state) args in
-    
-    let ordered_args = List.rev processed_args in
-    let (arg_regs, arg_code_lists) = List.split ordered_args in
-    let all_arg_codes = List.flatten arg_code_lists in
-    
-    let state_after_free = List.fold_left (fun st reg -> free_temp st reg) final_state arg_regs in
-    
-    (* 修改这里：正确处理超过8个参数 *)
-    let move_instructions = List.mapi (
-      fun i reg ->
-        if i < 8 then
-          [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
-        else
-          (* 超过8个的参数需要压栈 *)
-          [Store (reg, RiscvReg "sp", -(4 * (i - 8)))]  (* 简化的栈存储 *)
-    ) arg_regs in
-    
-    let move_codes = List.flatten move_instructions in
+        let process_code = 
+          if i < 8 then
+            (* 前8个参数移动到参数寄存器 *)
+            code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
+          else
+            (* 其余参数存储到栈 *)
+            code @ [Store (reg, RiscvReg "sp", -(4 * (i - 8)))]
+        in
+        let free_state = free_temp new_state reg in
+        (acc_results @ process_code, free_state)
+    ) ([], state) indexed_args in
     
     (* 调用函数 *)
     let is_void_func = 
@@ -370,13 +365,11 @@ let rec expr_to_ir state expr =
       with Not_found -> false
     in
     if is_void_func then
-      (* void函数调用 *)
-      let (temp, state') = fresh_temp state_after_free in
-      (temp, all_arg_codes @ move_codes @ [Call name; Li (temp, 0)], state')
+      let (temp, state') = fresh_temp final_state in
+      (temp, processed_args @ [Call name; Li (temp, 0)], state')
     else
-      (* 非void函数调用 *)
-      let (result_reg, state') = fresh_temp state_after_free in
-      (result_reg, all_arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
+      let (result_reg, state') = fresh_temp final_state in
+      (result_reg, processed_args @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
       let (temp, state'') = fresh_temp state' in
@@ -401,7 +394,7 @@ let rec expr_to_ir state expr =
     | Sub -> 
       (match e2 with
       | Num n -> 
-          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final)
+          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state_final) 
       | _ -> 
           (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
     | Mul -> 
@@ -573,6 +566,7 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
 
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
+
 module IRToRiscV = struct
   (* 寄存器分配映射 *)
   let reg_map var_offsets frame_size = function
@@ -764,29 +758,31 @@ module IRToRiscV = struct
         
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
-    (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
-    let base_size = 8 in
+  (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
+    let base_size = 24 in
     
     (* 参数空间：最多8个寄存器参数(a0-a7)，其余通过栈传递 *)
     let param_size = max 0 (List.length ir_func.params - 8) * 4 in
     
     (* 收集所有使用的栈偏移量 *)
-    let used_offsets = Hashtbl.create 50 in
+    let used_offsets = ref [] in
     
     (* 标记参数使用的偏移量 *)
     List.iteri (fun i _ ->
-      if i >= 8 then Hashtbl.add used_offsets (-(20 + i * 4)) ()
+      if i >= 8 then used_offsets := -(20 + i * 4) :: !used_offsets
     ) ir_func.params;
     
     (* 分析指令中的栈使用情况 *)
     let max_temp = ref (-1) in
-    let local_vars = Hashtbl.create 50 in
+    let min_offset = ref 0 in  (* 跟踪最小偏移量 *)
     
     let analyze_instr = function
       | Store (_, RiscvReg "s0", offset) when offset < 0 ->
-          Hashtbl.replace local_vars offset ()
+          used_offsets := offset :: !used_offsets;
+          if offset < !min_offset then min_offset := offset
       | Load (Temp n, RiscvReg "s0", offset) when offset < 0 ->
-          Hashtbl.replace local_vars offset ();
+          used_offsets := offset :: !used_offsets;
+          if offset < !min_offset then min_offset := offset;
           max_temp := max !max_temp n
       | Li (Temp n, _) | Mv (Temp n, _) | BinaryOp (_, Temp n, _, _)
       | BinaryOpImm (_, Temp n, _, _) | ReloadVar (Temp n, _) ->
@@ -797,9 +793,10 @@ module IRToRiscV = struct
     
     (* 计算局部变量所需空间 *)
     let local_var_size = 
-      if Hashtbl.length local_vars > 0 then
-        let min_offset = Hashtbl.fold (fun k _ acc -> min k acc) local_vars 0 in
-        abs min_offset - 20  (* 从-24开始计算 *)
+      if !used_offsets <> [] then
+        let min_used = !min_offset in
+        (* 计算从s0到最小偏移量的距离 *)
+        -min_used - 16  (* 减去16为保存寄存器和参数预留空间 *)
       else 0 in
     
     (* 计算临时寄存器所需空间 *)
@@ -867,7 +864,7 @@ module IRToRiscV = struct
     
     Buffer.contents buf
 end
-  
+
 (* 修改最后的输出部分 *)
 let () =
   (* 从标准输入读取 *)
