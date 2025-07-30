@@ -660,7 +660,7 @@ let () =
   
   (* 转换为RISC-V汇编 *)
   let riscv_asm = List.map IRToRiscV.func_to_asm ir in
-  
+  print_endline ".global main";
   (* 输出RISC-V汇编到stdout *)
   (* 输出每个函数 *)
   List.iter (fun f -> 
