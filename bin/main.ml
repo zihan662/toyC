@@ -449,63 +449,24 @@ let rec stmt_to_ir state stmt =
       let offset, state'' = get_var_offset_for_use state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
   | IfStmt (cond, then_stmt, else_stmt_opt) ->
-    let (cond_reg, cond_code, state') = expr_to_ir state cond in
-    let (then_label, state'') = fresh_label state' "then" in
-    let (else_label, state''') = fresh_label state'' "else" in
-    let (merge_label, state'''') = fresh_label state''' "merge" in
-    let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
-    let (else_code, state'''''') = 
-      match else_stmt_opt with
-      | Some s -> stmt_to_ir state''''' s
-      | None -> ([], state''''') in
-    
-    (* 检查分支是否以return结尾 *)
-    let ends_with_return code = 
-      match List.rev code with
-      | Ret :: _ -> true
-      | _ -> false
-    in
-    
-    let then_returns = ends_with_return then_code in
-    let else_returns = ends_with_return else_code in
-    
-    if then_returns && else_returns then
-      (* 两个分支都返回，不需要merge标签 *)
+      let (cond_reg, cond_code, state') = expr_to_ir state cond in
+      let (then_label, state'') = fresh_label state' "then" in
+      let (else_label, state''') = fresh_label state'' "else" in
+      let (merge_label, state'''') = fresh_label state''' "merge" in
+      let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
+      let (else_code, state'''''') = 
+        match else_stmt_opt with
+        | Some s -> stmt_to_ir state''''' s
+        | None -> ([], state''''') in
       (cond_code @ 
-      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+       [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
         Jmp else_label;
         Label then_label] @
-      then_code @
-      [Label else_label] @
-      else_code, state'''''')
-    else if then_returns then
-      (* 只有then分支返回 *)
-      (cond_code @ 
-      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
+       then_code @
+       [Jmp merge_label;
         Label else_label] @
-      else_code @
-      [Label then_label] @
-      then_code, state'''''')
-    else if else_returns then
-      (* 只有else分支返回 *)
-      (cond_code @ 
-      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
-        Jmp else_label;
-        Label then_label] @
-      then_code @
-      [Label else_label] @
-      else_code, state'''''')
-    else
-      (* 一般情况 *)
-      (cond_code @ 
-      [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
-        Jmp else_label;
-        Label then_label] @
-      then_code @
-      [Jmp merge_label;
-        Label else_label] @
-      else_code @
-      [Label merge_label], state'''''')
+       else_code @
+       [Label merge_label], state'''''')
   | ReturnStmt (Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state')
@@ -577,12 +538,16 @@ let func_to_ir (func : Ast.func_def) : ir_func =
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 module IRToRiscV = struct
   (* 寄存器分配映射 *)
-  let reg_map = function
+    let reg_map = function
     | RiscvReg s -> s
     | Temp n -> 
-        if n < 7 then Printf.sprintf "t%d" n
-        else if n < 15 then Printf.sprintf "a%d" (n-7)
-        else failwith "Register allocation overflow"
+        (* 优先使用a系列寄存器（避开a0, a1用于参数） *)
+        if n < 6 then 
+          Printf.sprintf "a%d" (n + 2)  (* a2, a3, a4, a5, a6, a7 *)
+        else if n < 13 then
+          Printf.sprintf "t%d" (n - 6)  (* t0, t1, t2, t3, t4, t5, t6 *)
+        else 
+          failwith "Register allocation overflow"
 
   (* 指令转换 - 使用sw/lw替换sd/ld，添加frame_size参数 *)
   let instr_to_asm frame_size = function
