@@ -98,6 +98,7 @@ let get_var_offset_for_declaration state var =
       let new_state = {state with stack_size = offset + 8} in
       (offset, new_state)
 
+
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
   | Num n -> string_of_int n
@@ -271,6 +272,7 @@ let semantic_analysis ast =
         check_stmt s expected_ret_type true
     | BreakStmt | ContinueStmt ->
         if not in_loop then raise (SemanticError "break/continue must be inside a loop")
+    | EmptyStmt -> ()
   and check_expr_calls expr =
     match expr with
     | Call (name, args) ->
@@ -296,7 +298,8 @@ let semantic_analysis ast =
     check_stmt (BlockStmt fd.body) fd.ret_type false;
     scope_stack := List.tl !scope_stack
   ) ast;
-  if not !has_main then raise (SemanticError "program must contain a main function")
+  if not !has_main then raise (SemanticError "program must contain a main function");
+  print_endline "Semantic analysis passed!"
 
 let parse_channel ch =
   let lex = Lexing.from_channel ch in
@@ -499,10 +502,8 @@ let func_to_ir (func : Ast.func_def) : ir_func =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
-    scope_stack = [Hashtbl.create (List.length func.params)]; (* 初始化作用域栈 *)
   } in
-  (* 将参数添加到当前作用域 *)
-  let state' = 
+    let state' = 
     List.fold_left (fun st (param : Ast.param) ->
       let offset, st' = get_var_offset_for_declaration st param.name in
       st'
