@@ -38,6 +38,7 @@ type codegen_state = {
   stack_size: int; (* 当前栈帧大小 *)
   loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
   scope_stack: (string, int) Hashtbl.t list; (* 作用域栈 *)
+  free_temps: int list; (* 可重用的临时寄存器列表 *)
 }
 
 let initial_state = {
@@ -47,12 +48,23 @@ let initial_state = {
   stack_size = 0;
   loop_labels = [];
   scope_stack = [];
+  free_temps = [];
 }
 
 (* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
-  let temp = state.temp_counter in
-  (Temp temp, {state with temp_counter = temp + 1})
+  match state.free_temps with
+  | temp :: rest -> 
+      (Temp temp, {state with free_temps = rest})
+  | [] -> 
+      let temp = state.temp_counter in
+      (Temp temp, {state with temp_counter = temp + 1})
+
+(* 释放临时寄存器以便重用 *)
+let free_temp state temp_reg = 
+  match temp_reg with
+  | Temp n -> {state with free_temps = n :: state.free_temps}
+  | RiscvReg _ -> state (* RISC-V寄存器不回收 *)
 
 let fresh_label state prefix =
   let label = Printf.sprintf "%s%d" prefix state.label_counter in
@@ -367,27 +379,31 @@ let rec expr_to_ir state expr =
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
       let (temp, state'') = fresh_temp state' in
+      let state''' = free_temp state'' e_reg in (* 释放输入寄存器 *)
       (match op with
        | Plus -> (e_reg, e_code, state')
-       | Minus -> (temp, e_code @ [BinaryOp ("sub", temp, RiscvReg "zero", e_reg)], state'')
+       | Minus -> (temp, e_code @ [BinaryOp ("sub", temp, RiscvReg "zero", e_reg)], state''')
        | Not -> 
-           let (ne_temp, state''') = fresh_temp state'' in
+           let (ne_temp, state'''') = fresh_temp state''' in
+           let state_final = free_temp state'''' ne_temp in
            (temp, e_code @ [BinaryOp ("sltu", ne_temp, RiscvReg "zero", e_reg);
-                            BinaryOpImm ("xori", temp, ne_temp, 1)], state'''))
+                            BinaryOpImm ("xori", temp, ne_temp, 1)], state_final))
     | Binary (op, e1, e2) ->
     let (e1_reg, e1_code, state') = expr_to_ir state e1 in
     let (e2_reg, e2_code, state'') = expr_to_ir state' e2 in
     let (temp, state''') = fresh_temp state'' in
+    let state_final = free_temp (free_temp state''' e1_reg) e2_reg in (* 释放输入寄存器 *)
     
     match op with
     | Add -> 
-        (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state''')
+        (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state_final)
     | Sub -> 
       (match e2 with
       | Num n -> 
-          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state''')
+          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], 
+           free_temp state''' e1_reg) (* 释放e1_reg *)
       | _ -> 
-          (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state'''))
+          (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state_final))
     | Mul -> 
         (* 检查e1和e2中是否有函数调用 *)
         let e1_has_call = List.exists (function Call _ -> true | _ -> false) e1_code in
@@ -396,45 +412,48 @@ let rec expr_to_ir state expr =
         (match (e1, e2) with
         | (Var x1, _) when e2_has_call -> 
             (* 如果左侧是变量，右侧包含函数调用 *)
-            (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
+            (temp, e1_code @ e2_code @ [ReloadVar (e1_reg, x1); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
         | (_, Var x2) when e1_has_call -> 
             (* 如果右侧是变量，左侧包含函数调用 *)
-            (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
+            (temp, e1_code @ e2_code @ [ReloadVar (e2_reg, x2); BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final)
         | _ -> 
-            (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state'''))
+            (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state_final))
     | Div -> 
-        (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state''')
+        (temp, e1_code @ e2_code @ [BinaryOp ("div", temp, e1_reg, e2_reg)], state_final)
     | Mod -> 
-        (temp, e1_code @ e2_code @ [BinaryOp ("rem", temp, e1_reg, e2_reg)], state''')
+        (temp, e1_code @ e2_code @ [BinaryOp ("rem", temp, e1_reg, e2_reg)], state_final)
     | Lt -> 
-        (temp, e1_code @ e2_code @ [BinaryOp ("slt", temp, e1_reg, e2_reg)], state''')
+        (temp, e1_code @ e2_code @ [BinaryOp ("slt", temp, e1_reg, e2_reg)], state_final)
     | Gt -> 
         (* a > b 转换为 b < a *)
         let code = e1_code @ e2_code @ [BinaryOp ("slt", temp, e2_reg, e1_reg)] in
-        (temp, code, state''')
+        (temp, code, state_final)
     | Leq ->
     (* a <= b 转换为 !(b < a) *)
-    let (lt_temp, state'''') = fresh_temp state''' in
+    let (lt_temp, state'''') = fresh_temp state_final in
+    let state_final' = free_temp state'''' lt_temp in
     let code = e1_code @ e2_code @
       [BinaryOp ("slt", lt_temp, e2_reg, e1_reg);
        BinaryOpImm ("xori", temp, lt_temp, 1)] in
-    (temp, code, state'''')
+    (temp, code, state_final')
     | Geq ->
         (* a >= b 转换为 !(a < b) *)
-        let (lt_temp, state'''') = fresh_temp state''' in
+        let (lt_temp, state'''') = fresh_temp state_final in
+        let state_final' = free_temp state'''' lt_temp in
         let code = e1_code @ e2_code @
           [BinaryOp ("slt", lt_temp, e1_reg, e2_reg);
           BinaryOpImm ("xori", temp, lt_temp, 1)] in
-        (temp, code, state'''')
+        (temp, code, state_final')
     | Eq ->
         (* a == b 转换为 (a ^ b) == 0 *)
-        let (xor_temp, state'''') = fresh_temp state''' in
+        let (xor_temp, state'''') = fresh_temp state_final in
         let (sltu_temp, state''''') = fresh_temp state'''' in
+        let state_final'' = free_temp (free_temp state''''' xor_temp) sltu_temp in
         let code = e1_code @ e2_code @
           [BinaryOp ("xor", xor_temp, e1_reg, e2_reg);
           BinaryOp ("sltu", sltu_temp, RiscvReg "zero", xor_temp);
           BinaryOpImm ("xori", temp, sltu_temp, 1)] in
-        (temp, code, state''''')
+        (temp, code, state_final'')
   | _ -> failwith "Unsupported expression"
 
 let enter_scope state =
@@ -452,14 +471,16 @@ let rec stmt_to_ir state stmt =
   | DeclStmt (_, name, Some expr) -> (* 带初始化的声明 *)
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_declaration state' name in
-      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
+      let state''' = free_temp state'' expr_reg in (* 释放表达式寄存器 *)
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
   | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
       let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
   | AssignStmt (name, expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_use state' name in
-      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
+      let state''' = free_temp state'' expr_reg in (* 释放表达式寄存器 *)
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
   | IfStmt (cond, then_stmt, else_stmt_opt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
       let (then_label, state'') = fresh_label state' "then" in
@@ -470,6 +491,7 @@ let rec stmt_to_ir state stmt =
         match else_stmt_opt with
         | Some s -> stmt_to_ir state''''' s
         | None -> ([], state''''') in
+      let state_final = free_temp state'''''' cond_reg in (* 释放条件寄存器 *)
       (cond_code @ 
        [Branch ("bnez", cond_reg, RiscvReg "zero", then_label);
         Jmp else_label;
@@ -478,15 +500,17 @@ let rec stmt_to_ir state stmt =
        [Jmp merge_label;
         Label else_label] @
        else_code @
-       [Label merge_label], state'''''')
+       [Label merge_label], state_final)
   | ReturnStmt (Some expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state')
+      let state'' = free_temp state' expr_reg in (* 释放表达式寄存器 *)
+      (expr_code @ [Mv (RiscvReg "a0", expr_reg); Ret], state'')
   | ReturnStmt None ->
       ([Ret], state)
   | ExprStmt expr ->
-      let (_, expr_code, state') = expr_to_ir state expr in
-      (expr_code, state')
+      let (expr_reg, expr_code, state') = expr_to_ir state expr in
+      let state'' = free_temp state' expr_reg in (* 释放表达式寄存器 *)
+      (expr_code, state'')
   | WhileStmt (cond, body) ->
       let (loop_label, state') = fresh_label state "loop" in
       let (end_label, state'') = fresh_label state' "end" in
@@ -495,6 +519,7 @@ let rec stmt_to_ir state stmt =
       
       let (cond_reg, cond_code, state''') = expr_to_ir state_with_loop cond in
       let (body_code, state'''') = stmt_to_ir state''' body in
+      let state_final = free_temp state'''' cond_reg in (* 释放条件寄存器 *)
       
       ( [Label loop_label] @
         cond_code @
@@ -502,7 +527,7 @@ let rec stmt_to_ir state stmt =
         body_code @
         [Jmp loop_label;
          Label end_label],
-        { state'''' with loop_labels = List.tl state''''.loop_labels } )
+        { state_final with loop_labels = List.tl state_final.loop_labels } )
   
   | BreakStmt ->
       (match state.loop_labels with
@@ -677,6 +702,7 @@ module IRToRiscV = struct
     
     Buffer.contents buf
 end
+
 (* 修改最后的输出部分 *)
 let () =
   (* 从标准输入读取 *)
