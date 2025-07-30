@@ -538,8 +538,8 @@ module IRToRiscV = struct
         else if n < 15 then Printf.sprintf "a%d" (n-7)
         else failwith "Register allocation overflow"
 
-  (* 指令转换 - 使用sw/lw替换sd/ld *)
-  let instr_to_asm = function
+  (* 指令转换 - 使用sw/lw替换sd/ld，添加frame_size参数 *)
+  let instr_to_asm frame_size = function
     | Li (r, n) -> 
         Printf.sprintf "  li %s, %d" (reg_map r) n
     | Mv (rd, rs) ->
@@ -560,7 +560,12 @@ module IRToRiscV = struct
     | Call func ->
        "  call " ^ func
     | Ret ->
-       "  jr ra"
+        let ra_offset = frame_size - 4 in      
+        let s0_offset = frame_size - 8 in      
+        Printf.sprintf "  lw ra, %d(sp)\n" ra_offset ^
+        Printf.sprintf "  lw s0, %d(sp)\n" s0_offset ^
+        Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
+        "  jr ra"                 
     | Store (rs, base, offset) ->
         Printf.sprintf "  sw %s, %d(%s)" (reg_map rs) offset (reg_map base)
     | Load (rd, base, offset) ->
@@ -615,14 +620,12 @@ module IRToRiscV = struct
     Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
     "  ret\n"  (* 使用ret而不是jr ra *)
 
-    (* 转换整个IR函数 *)
+  (* 转换整个IR函数 *)
   let func_to_asm (ir_func : ir_func) =
     let buf = Buffer.create 256 in
     let frame_size = calculate_frame_size ir_func in
     
-    (* 函数头 *)
-    Buffer.add_string buf (Printf.sprintf ".global %s\n" ir_func.name);
-    Buffer.add_string buf (Printf.sprintf ".type %s, @function\n" ir_func.name);
+    (* 函数序言 *)
     Buffer.add_string buf (function_prologue ir_func.name frame_size);
     
     (* 保存参数到栈帧 - 使用负偏移量 *)
@@ -631,29 +634,17 @@ module IRToRiscV = struct
       Buffer.add_string buf (Printf.sprintf "  sw a%d, %d(s0)\n" i offset)
     ) ir_func.params;
     
-    (* 转换指令 *)
+    (* 转换指令，传入frame_size参数 *)
     List.iter (fun instr ->
-      Buffer.add_string buf (instr_to_asm instr ^ "\n")
+      Buffer.add_string buf (instr_to_asm frame_size instr ^ "\n")
     ) ir_func.body;
     
     (* 检查是否已经有显式的返回指令 *)
     let has_explicit_return = List.exists (function Ret -> true | _ -> false) ir_func.body in
     
-    (* 添加栈恢复代码（除了ret指令） *)
-    let ra_offset = frame_size - 4 in 
-    let s0_offset = frame_size - 8 in 
-    Buffer.add_string buf (Printf.sprintf "  lw ra, %d(sp)\n" ra_offset);
-    Buffer.add_string buf (Printf.sprintf "  lw s0, %d(sp)\n" s0_offset);
-    Buffer.add_string buf (Printf.sprintf "  addi sp, sp, %d\n" frame_size);
-    
-    (* 对于main函数，添加模256处理 *)
-    if ir_func.name = "main" then (
-      Buffer.add_string buf "  andi a0, a0, 255\n";
-    );
-    
-    (* 只有在没有显式返回时才添加返回指令 *)
+    (* 如果没有显式返回指令，则添加函数尾声 *)
     if not has_explicit_return then (
-      Buffer.add_string buf "  jr ra\n";
+      Buffer.add_string buf (function_epilogue frame_size);
     );
     
     Buffer.contents buf
