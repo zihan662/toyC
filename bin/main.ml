@@ -324,43 +324,46 @@ let rec expr_to_ir state expr =
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
   | Call (name, args) ->
-      (* 处理函数调用 *)
-      let (arg_regs, arg_codes, state') = List.fold_left (
-        fun (regs, codes, st) arg ->
-          let (reg, code, st') = expr_to_ir st arg in
-          (reg :: regs, code @ codes, st')
-      ) ([], [], state) args in
-      let arg_regs = List.rev arg_regs in
-      let arg_codes = List.rev arg_codes in
-      
-      (* 将参数移动到a0, a1, ...寄存器 *)
-      let (move_codes, state'') = List.fold_left (
-        fun (codes, st) (i, reg) ->
-          let (temp_reg, st') = 
-            if i < 8 then 
-              (RiscvReg ("a" ^ string_of_int i), st) 
-            else 
-              fresh_temp st in
-          let move_code = [Mv (temp_reg, reg)] in
-          (move_code @ codes, st')
-      ) ([], state') (List.mapi (fun i x -> (i, x)) arg_regs) in
-      
-      let move_codes = List.rev move_codes in
-      
-       let is_void_func = 
-        try
-          let func_info = Hashtbl.find func_table name in
-          func_info.ret_type = Void
-        with Not_found -> false
-      in
-      if is_void_func then
-        (* void函数调用，不关心返回值 *)
-        let (temp, state''') = fresh_temp state'' in
-        (temp, arg_codes @ move_codes @ [Call name; Li (temp, 0)], state''')
-      else
-        (* 非void函数调用，需要处理返回值 *)
-        let (result_reg, state''') = fresh_temp state'' in
-        (result_reg, arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state''')
+    (* 按正确顺序处理参数 *)
+    let (processed_args, final_state) = List.fold_left (
+      fun (acc_results, acc_state) arg_expr ->
+        let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
+        ((reg, code) :: acc_results, new_state)
+    ) ([], state) args in
+    
+    (* 保持参数顺序 *)
+    let ordered_args = List.rev processed_args in
+    
+    (* 分离寄存器和代码 *)
+    let (arg_regs, arg_code_lists) = List.split ordered_args in
+    let all_arg_codes = List.flatten arg_code_lists in
+    
+    (* 生成参数移动指令 *)
+    let move_instructions = List.mapi (
+      fun i reg ->
+        if i < 8 then
+          [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
+        else
+          []
+    ) arg_regs in
+    
+    let move_codes = List.flatten move_instructions in
+    
+    (* 调用函数 *)
+    let is_void_func = 
+      try
+        let func_info = Hashtbl.find func_table name in
+        func_info.ret_type = Void
+      with Not_found -> false
+    in
+    if is_void_func then
+      (* void函数调用 *)
+      let (temp, state') = fresh_temp final_state in
+      (temp, all_arg_codes @ move_codes @ [Call name; Li (temp, 0)], state')
+    else
+      (* 非void函数调用 *)
+      let (result_reg, state') = fresh_temp final_state in
+      (result_reg, all_arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
       let (temp, state'') = fresh_temp state' in
@@ -380,7 +383,11 @@ let rec expr_to_ir state expr =
     | Add -> 
         (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state''')
     | Sub -> 
-        (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state''')
+      (match e2 with
+      | Num n -> 
+          (temp, e1_code @ [BinaryOpImm ("addi", temp, e1_reg, -n)], state''')
+      | _ -> 
+          (temp, e1_code @ e2_code @ [BinaryOp ("sub", temp, e1_reg, e2_reg)], state'''))
     | Mul -> 
         (temp, e1_code @ e2_code @ [BinaryOp ("mul", temp, e1_reg, e2_reg)], state''')
     | Div -> 
@@ -441,7 +448,7 @@ let rec stmt_to_ir state stmt =
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_use state' name in
       (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
-    | IfStmt (cond, then_stmt, else_stmt_opt) ->
+  | IfStmt (cond, then_stmt, else_stmt_opt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
       let (then_label, state'') = fresh_label state' "then" in
       let (else_label, state''') = fresh_label state'' "else" in
@@ -549,10 +556,10 @@ module IRToRiscV = struct
     | BinaryOpImm (op, rd, rs, imm) ->
         Printf.sprintf "  %s %s, %s, %d" op (reg_map rd) (reg_map rs) imm
     | Branch (cond, rs1, rs2, label) ->
-        (match cond with
-          | "beqz" -> Printf.sprintf "  beq %s, zero, %s" (reg_map rs1) label
-          | "bnez" -> Printf.sprintf "  bne %s, zero, %s" (reg_map rs1) label
-          | _ -> Printf.sprintf "  %s %s, %s, %s" cond (reg_map rs1) (reg_map rs2) label)
+    (match cond with
+      | "beqz" -> Printf.sprintf "  beq %s, zero, %s" (reg_map rs1) label
+      | "bnez" -> Printf.sprintf "  bne %s, zero, %s" (reg_map rs1) label
+      | _ -> Printf.sprintf "  %s %s, %s, %s" cond (reg_map rs1) (reg_map rs2) label)
     | Jmp label ->
         "  j " ^ label
     | Label label ->
