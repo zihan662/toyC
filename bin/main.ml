@@ -59,6 +59,7 @@ let fresh_label state prefix =
   (label, {state with label_counter = state.label_counter + 1})
 
 
+(* 修改 get_var_offset_for_use 函数 *)
 let get_var_offset_for_use state var =
   (* 在作用域栈中查找变量，从当前作用域开始向外 *)
   let rec lookup scopes =
@@ -82,7 +83,6 @@ let get_var_offset_for_use state var =
        with Not_found ->
          (* 变量不存在，这应该是错误情况 *)
          failwith ("Variable " ^ var ^ " not found"))
-
 let get_var_offset_for_declaration state var =
   (* 变量声明时，只在当前作用域创建变量 *)
   match state.scope_stack with
@@ -271,7 +271,7 @@ let semantic_analysis ast =
         ignore (infer_expr_type cond);
         check_stmt s expected_ret_type true
     | BreakStmt | ContinueStmt ->
-        if not in_loop then raise (SemanticError "break/continue must be inside a loop")
+      if not in_loop then raise (SemanticError "break/continue must be inside a loop")
     | EmptyStmt -> ()
   and check_expr_calls expr =
     match expr with
@@ -324,7 +324,7 @@ let rec expr_to_ir state expr =
   | Var x -> 
       let offset, state' = get_var_offset_for_use state x in
       let (temp, state'') = fresh_temp state' in
-      (temp, [Load (temp, RiscvReg "sp", offset)], state'')
+      (temp, [Load (temp, RiscvReg "s0", offset)], state'')
   | Call (name, args) ->
       (* 处理函数调用 *)
       let (arg_regs, arg_codes, state') = List.fold_left (
@@ -424,22 +424,22 @@ let rec stmt_to_ir state stmt =
   | DeclStmt (_, name, Some expr) -> (* 带初始化的声明 *)
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_declaration state' name in
-      (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
   | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
       let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
   | AssignStmt (name, expr) ->
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_use state' name in
-      (expr_code @ [Store (expr_reg, RiscvReg "sp", offset)], state'')
-  | IfStmt (cond, then_stmt, else_stmt) ->
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state'')
+    | IfStmt (cond, then_stmt, else_stmt_opt) ->
       let (cond_reg, cond_code, state') = expr_to_ir state cond in
       let (then_label, state'') = fresh_label state' "then" in
       let (else_label, state''') = fresh_label state'' "else" in
       let (merge_label, state'''') = fresh_label state''' "merge" in
       let (then_code, state''''') = stmt_to_ir state'''' then_stmt in
       let (else_code, state'''''') = 
-        match else_stmt with
+        match else_stmt_opt with
         | Some s -> stmt_to_ir state''''' s
         | None -> ([], state''''') in
       (cond_code @ 
@@ -502,11 +502,13 @@ let func_to_ir (func : Ast.func_def) : ir_func =
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
   } in
+    (* 为参数设置固定的偏移量，不增加stack_size *)
     let state' = 
-    List.fold_left (fun st (param : Ast.param) ->
-      let offset, st' = get_var_offset_for_declaration st param.name in
-      st'
-    ) state func.params
+    List.fold_left (fun st (i, (param : Ast.param)) ->
+      let offset = i * 4 in  (* 参数偏移量: 0, 4, 8, ... *)
+      Hashtbl.add st.var_offset param.name offset;
+      st
+    ) state (List.mapi (fun i x -> (i, x)) func.params)
   in
   let (body_code, final_state) = block_to_ir state' func.body in
   {
