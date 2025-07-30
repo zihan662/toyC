@@ -350,6 +350,9 @@ let rec expr_to_ir state expr =
     let (arg_regs, arg_code_lists) = List.split ordered_args in
     let all_arg_codes = List.flatten arg_code_lists in
     
+    (* 释放参数寄存器，因为它们即将被移动到a寄存器 *)
+    let state_after_free = List.fold_left (fun st reg -> free_temp st reg) final_state arg_regs in
+    
     (* 生成参数移动指令 *)
     let move_instructions = List.mapi (
       fun i reg ->
@@ -370,11 +373,11 @@ let rec expr_to_ir state expr =
     in
     if is_void_func then
       (* void函数调用 *)
-      let (temp, state') = fresh_temp final_state in
+      let (temp, state') = fresh_temp state_after_free in
       (temp, all_arg_codes @ move_codes @ [Call name; Li (temp, 0)], state')
     else
       (* 非void函数调用 *)
-      let (result_reg, state') = fresh_temp final_state in
+      let (result_reg, state') = fresh_temp state_after_free in
       (result_reg, all_arg_codes @ move_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
@@ -575,12 +578,13 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 module IRToRiscV = struct
   (* 寄存器分配映射 *)
-  let reg_map = function
+   let reg_map = function
     | RiscvReg s -> s
     | Temp n -> 
-        if n < 7 then Printf.sprintf "t%d" n
-        else if n < 15 then Printf.sprintf "a%d" (n-7)
-        else failwith "Register allocation overflow"
+        if n < 7 then Printf.sprintf "t%d" n           (* t0-t6 *)
+        else if n < 15 then Printf.sprintf "a%d" (n-7) (* a0-a7 *)
+        else if n < 27 then Printf.sprintf "s%d" (n-15) (* s0-s11 *)
+        else Printf.sprintf "t%d" ((n-27) mod 7) (* 循环使用t寄存器作为后备 *)
 
   (* 指令转换 - 使用sw/lw替换sd/ld，添加frame_size参数 *)
   let instr_to_asm var_offsets frame_size = function
