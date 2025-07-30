@@ -576,7 +576,6 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 module IRToRiscV = struct
   (* 寄存器分配映射 *)
-(* 修改IRToRiscV模块中的reg_map函数 *)
   let reg_map var_offsets frame_size = function
     | RiscvReg s -> s
     | Temp n -> 
@@ -585,69 +584,69 @@ module IRToRiscV = struct
         else if n < 15 then 
           Printf.sprintf "a%d" (n - 7)
         else
-          (* 当寄存器不足时，使用栈空间 *)
-          let stack_offset = -(frame_size - 4 - (n * 4)) in
-          Printf.sprintf "%d(sp)" stack_offset
+          (* 当寄存器不足时，使用栈空间，统一使用s0作为基址 *)
+          let stack_offset = -(20 + (n - 15 + 1) * 4) in
+          Printf.sprintf "%d(s0)" stack_offset
 
   (* 修改instr_to_asm函数以处理栈访问 *)
   let instr_to_asm var_offsets frame_size = function
     | Li (r, n) -> 
         (match r with
         | Temp n when n >= 15 -> 
-            (* 直接存储到栈上 *)
-            let stack_offset = -(20 + (n * 4)) in
-            Printf.sprintf "  li t0, %d\n  sw t0, %d(sp)" n stack_offset
+            (* 直接存储到栈上，使用s0作为基址 *)
+            let stack_offset = -(20 + (n - 15 + 1) * 4) in
+            Printf.sprintf "  li t0, %d\n  sw t0, %d(s0)" n stack_offset
         | _ -> 
             Printf.sprintf "  li %s, %d" (reg_map var_offsets frame_size r) n)
     | Mv (rd, rs) ->
         (match (rd, rs) with
         | (Temp n, _) when n >= 15 -> 
             (* 目标是栈位置，先移动到临时寄存器再存储 *)
-            let stack_offset = -(20 + (n * 4)) in
-            Printf.sprintf "  mv t0, %s\n  sw t0, %d(sp)" (reg_map var_offsets frame_size rs) stack_offset
+            let stack_offset = -(20 + (n - 15 + 1) * 4) in
+            Printf.sprintf "  mv t0, %s\n  sw t0, %d(s0)" (reg_map var_offsets frame_size rs) stack_offset
         | (_, Temp n) when n >= 15 -> 
             (* 源是栈位置，先加载再移动 *)
-            let stack_offset = -(20 + (n * 4)) in
-            Printf.sprintf "  lw t0, %d(sp)\n  mv %s, t0" stack_offset (reg_map var_offsets frame_size rd)
+            let stack_offset = -(20 + (n - 15 + 1) * 4) in
+            Printf.sprintf "  lw t0, %d(s0)\n  mv %s, t0" stack_offset (reg_map var_offsets frame_size rd)
         | _ -> 
             Printf.sprintf "  mv %s, %s" (reg_map var_offsets frame_size rd) (reg_map var_offsets frame_size rs))
     | BinaryOp (op, rd, rs1, rs2) ->
         (match (rd, rs1, rs2) with
         | (Temp n, _, _) when n >= 15 -> 
             (* 结果存储到栈 *)
-            let stack_offset = -(20 + (n * 4)) in
+            let stack_offset = -(20 + (n - 15 + 1) * 4) in
             let src1 = reg_map var_offsets frame_size rs1 in
             let src2 = reg_map var_offsets frame_size rs2 in
             let (reg1, load1) = 
               match rs1 with
               | Temp m when m >= 15 -> 
-                  let offset = -(20 + (m * 4)) in
-                  ("t1", Printf.sprintf "  lw t1, %d(sp)\n" offset)
+                  let offset = -(20 + (m - 15 + 1) * 4) in
+                  ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
               | _ -> (src1, "")
             in
             let (reg2, load2) = 
               match rs2 with
               | Temp m when m >= 15 -> 
-                  let offset = -(20 + (m * 4)) in
-                  ("t2", Printf.sprintf "  lw t2, %d(sp)\n" offset)
+                  let offset = -(20 + (m - 15 + 1) * 4) in
+                  ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
               | _ -> (src2, "")
             in
             load1 ^ load2 ^ 
-            Printf.sprintf "  %s t0, %s, %s\n  sw t0, %d(sp)" op reg1 reg2 stack_offset
+            Printf.sprintf "  %s t0, %s, %s\n  sw t0, %d(s0)" op reg1 reg2 stack_offset
         | _ ->
             let dest = reg_map var_offsets frame_size rd in
             let (reg1, load1) = 
               match rs1 with
               | Temp m when m >= 15 -> 
-                  let offset = -(20 + (m * 4)) in
-                  ("t1", Printf.sprintf "  lw t1, %d(sp)\n" offset)
+                  let offset = -(20 + (m - 15 + 1) * 4) in
+                  ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
               | _ -> (reg_map var_offsets frame_size rs1, "")
             in
             let (reg2, load2) = 
               match rs2 with
               | Temp m when m >= 15 -> 
-                  let offset = -(20 + (m * 4)) in
-                  ("t2", Printf.sprintf "  lw t2, %d(sp)\n" offset)
+                  let offset = -(20 + (m - 15 + 1) * 4) in
+                  ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
               | _ -> (reg_map var_offsets frame_size rs2, "")
             in
             let dest_reg = 
@@ -659,31 +658,31 @@ module IRToRiscV = struct
             Printf.sprintf "  %s %s, %s, %s" op dest_reg reg1 reg2 ^
             (match rd with
               | Temp m when m >= 15 -> 
-                  let stack_offset = -(20 + (m * 4)) in
-                  Printf.sprintf "\n  sw t0, %d(sp)" stack_offset
+                  let stack_offset = -(20 + (m - 15 + 1) * 4) in
+                  Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
               | _ -> ""))
     | BinaryOpImm (op, rd, rs, imm) ->
         (match (rd, rs) with
         | (Temp n, _) when n >= 15 -> 
             (* 结果存储到栈 *)
-            let stack_offset = -(20 + (n * 4)) in
+            let stack_offset = -(20 + (n - 15 + 1) * 4) in
             let src = reg_map var_offsets frame_size rs in
             let (reg, load) = 
               match rs with
               | Temp m when m >= 15 -> 
-                  let offset = -(20 + (m * 4)) in
-                  ("t1", Printf.sprintf "  lw t1, %d(sp)\n" offset)
+                  let offset = -(20 + (m - 15 + 1) * 4) in
+                  ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
               | _ -> (src, "")
             in
             load ^ 
-            Printf.sprintf "  %s t0, %s, %d\n  sw t0, %d(sp)" op reg imm stack_offset
+            Printf.sprintf "  %s t0, %s, %d\n  sw t0, %d(s0)" op reg imm stack_offset
         | _ ->
             let dest = reg_map var_offsets frame_size rd in
             let (reg, load) = 
               match rs with
               | Temp m when m >= 15 -> 
-                  let offset = -(20 + (m * 4)) in
-                  ("t1", Printf.sprintf "  lw t1, %d(sp)\n" offset)
+                  let offset = -(20 + (m - 15 + 1) * 4) in
+                  ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
               | _ -> (reg_map var_offsets frame_size rs, "")
             in
             let dest_reg = 
@@ -695,22 +694,22 @@ module IRToRiscV = struct
             Printf.sprintf "  %s %s, %s, %d" op dest_reg reg imm ^
             (match rd with
               | Temp m when m >= 15 -> 
-                  let stack_offset = -(20 + (m * 4)) in
-                  Printf.sprintf "\n  sw t0, %d(sp)" stack_offset
+                  let stack_offset = -(20 + (m - 15 + 1) * 4) in
+                  Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
               | _ -> ""))
     | Branch (cond, rs1, rs2, label) ->
         let (reg1, load1) = 
           match rs1 with
           | Temp m when m >= 15 -> 
-              let offset = -(20 + (m * 4)) in
-              ("t1", Printf.sprintf "  lw t1, %d(sp)\n" offset)
+              let offset = -(20 + (m - 15 + 1) * 4) in
+              ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
           | _ -> (reg_map var_offsets frame_size rs1, "")
         in
         let (reg2, load2) = 
           match rs2 with
           | Temp m when m >= 15 -> 
-              let offset = -(20 + (m * 4)) in
-              ("t2", Printf.sprintf "  lw t2, %d(sp)\n" offset)
+              let offset = -(20 + (m - 15 + 1) * 4) in
+              ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
           | _ -> (reg_map var_offsets frame_size rs2, "")
         in
         load1 ^ load2 ^
@@ -722,8 +721,8 @@ module IRToRiscV = struct
         let (reg, load) = 
           match rs with
           | Temp m when m >= 15 -> 
-              let stack_offset = -(20 + (m * 4)) in
-              ("t0", Printf.sprintf "  lw t0, %d(sp)\n" stack_offset)
+              let stack_offset = -(20 + (m - 15 + 1) * 4) in
+              ("t0", Printf.sprintf "  lw t0, %d(s0)\n" stack_offset)
           | _ -> (reg_map var_offsets frame_size rs, "")
         in
         load ^ Printf.sprintf "  sw %s, %d(%s)" reg offset (reg_map var_offsets frame_size base)
@@ -731,8 +730,8 @@ module IRToRiscV = struct
         (match rd with
         | Temp n when n >= 15 -> 
             (* 加载到栈位置 *)
-            let stack_offset = -(20 + (n * 4)) in
-            Printf.sprintf "  lw t0, %d(%s)\n  sw t0, %d(sp)" 
+            let stack_offset = -(20 + (n - 15 + 1) * 4) in
+            Printf.sprintf "  lw t0, %d(%s)\n  sw t0, %d(s0)" 
               offset (reg_map var_offsets frame_size base) stack_offset
         | _ -> 
             Printf.sprintf "  lw %s, %d(%s)" 
@@ -742,9 +741,9 @@ module IRToRiscV = struct
         (try
           let offset = Hashtbl.find var_offsets var_name in
           (match reg with
-          | Temp n when n >= 7 -> 
-              let stack_offset = -(frame_size - 4 - (n * 4)) in
-              Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(sp)" offset stack_offset
+          | Temp n when n >= 15 -> 
+              let temp_offset = -(20 + (n - 15 + 1) * 4) in
+              Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" offset temp_offset
           | _ -> 
               Printf.sprintf "  lw %s, %d(s0)" (reg_map var_offsets frame_size reg) offset)
         with Not_found ->
@@ -763,6 +762,7 @@ module IRToRiscV = struct
             Printf.sprintf "  addi sp, sp, %d\n" frame_size ^
             "  jr ra"
         | _ -> failwith "Unhandled instruction"
+        
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
     (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
@@ -805,7 +805,7 @@ module IRToRiscV = struct
     
     (* 计算临时寄存器所需空间 *)
     let temp_stack_size = 
-      if !max_temp >= 7 then (!max_temp - 6) * 4 else 0 in
+      if !max_temp >= 15 then (!max_temp - 14) * 4 else 0 in
     
     (* 总需求空间 *)
     let required_space = base_size + param_size + local_var_size + temp_stack_size in
@@ -868,7 +868,7 @@ module IRToRiscV = struct
     
     Buffer.contents buf
 end
-
+  
 (* 修改最后的输出部分 *)
 let () =
   (* 从标准输入读取 *)
