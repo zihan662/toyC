@@ -765,36 +765,53 @@ module IRToRiscV = struct
         | _ -> failwith "Unhandled instruction"
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
-    (* 基础栈帧大小：保存 ra(4字节) + s0(4字节) = 8字节 *)
+    (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
     let base_size = 8 in
     
-    (* 参数需要的空间: 参数数量 * 4字节 *)
-    let param_size = List.length ir_func.params * 4 in
+    (* 参数空间：最多8个寄存器参数(a0-a7)，其余通过栈传递 *)
+    let param_size = max 0 (List.length ir_func.params - 8) * 4 in
     
-    (* 计算最大临时寄存器编号 *)
-    let max_temp_reg = ref (-1) in
-    let update_max_temp instr =
-      let check_reg = function
-        | Temp n -> max_temp_reg := max !max_temp_reg n
-        | _ -> ()
-      in
-      match instr with
-      | Li (r, _) | Mv (r, _) | Load (r, _, _) -> check_reg r
-      | BinaryOp (_, r, _, _) | BinaryOpImm (_, r, _, _) -> check_reg r
-      | Store (r, _, _) -> check_reg r
-      | ReloadVar (r, _) -> check_reg r
+    (* 收集所有使用的栈偏移量 *)
+    let used_offsets = Hashtbl.create 50 in
+    
+    (* 标记参数使用的偏移量 *)
+    List.iteri (fun i _ ->
+      if i >= 8 then Hashtbl.add used_offsets (-(20 + i * 4)) ()
+    ) ir_func.params;
+    
+    (* 分析指令中的栈使用情况 *)
+    let max_temp = ref (-1) in
+    let local_vars = Hashtbl.create 50 in
+    
+    let analyze_instr = function
+      | Store (_, RiscvReg "s0", offset) when offset < 0 ->
+          Hashtbl.replace local_vars offset ()
+      | Load (Temp n, RiscvReg "s0", offset) when offset < 0 ->
+          Hashtbl.replace local_vars offset ();
+          max_temp := max !max_temp n
+      | Li (Temp n, _) | Mv (Temp n, _) | BinaryOp (_, Temp n, _, _)
+      | BinaryOpImm (_, Temp n, _, _) | ReloadVar (Temp n, _) ->
+          max_temp := max !max_temp n
       | _ -> ()
     in
-    List.iter update_max_temp ir_func.body;
+    List.iter analyze_instr ir_func.body;
     
-    (* 为临时寄存器预留栈空间 *)
-    let temp_stack_size = if !max_temp_reg >= 7 then (!max_temp_reg - 6) * 4 else 0 in
+    (* 计算局部变量所需空间 *)
+    let local_var_size = 
+      if Hashtbl.length local_vars > 0 then
+        let min_offset = Hashtbl.fold (fun k _ acc -> min k acc) local_vars 0 in
+        abs min_offset - 20  (* 从-24开始计算 *)
+      else 0 in
     
-    (* 确保栈帧足够大 *)
-    let required_stack_size = base_size + param_size + temp_stack_size in
+    (* 计算临时寄存器所需空间 *)
+    let temp_stack_size = 
+      if !max_temp >= 7 then (!max_temp - 6) * 4 else 0 in
     
-    (* 向上取整到16的倍数 *)
-    let aligned_size = ((required_stack_size + 15) / 16) * 16 in
+    (* 总需求空间 *)
+    let required_space = base_size + param_size + local_var_size + temp_stack_size in
+    
+    (* 对齐到16字节边界 *)
+    let aligned_size = ((required_space + 15) / 16) * 16 in
     
     (* 确保最小栈帧大小 *)
     max aligned_size 32
