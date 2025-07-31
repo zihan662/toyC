@@ -909,24 +909,44 @@ let instr_to_asm var_offsets frame_size instrs =
         
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
-  (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
-    let base_size = 80 in
+    (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
+    let base_size = 80 in (* 至少16字节用于保存 ra 和 s0 *)
     
-    (* 参数空间：最多8个寄存器参数(a0-a7)，其余通过栈传递 *)
-    let param_size = max 0 (List.length ir_func.params - 8) * 4 in
-    
-    (* 收集所有使用的栈偏移量 *)
+    (* 计算额外参数需要的空间 *)
+    let extra_param_space = 
+      if List.length ir_func.params > 8 then
+        (List.length ir_func.params - 8) * 4
+      else 
+        0 
+    in
+
+    (* 分析指令，计算调用其他函数时需要的栈空间 *)
+    let call_stack_space = ref 0 in
+    let analyze_call_stack instr = 
+      match instr with
+      | Store (_, RiscvReg "sp", offset) when offset >= 0 ->
+          call_stack_space := max !call_stack_space (offset + 4)
+      | _ -> ()
+    in
+    List.iter analyze_call_stack ir_func.body;
+
+    (* 收集所有使用的负向栈偏移量 (本地变量和前8个参数) *)
     let used_offsets = ref [] in
     
-    (* 标记参数使用的偏移量 *)
+    (* 标记前8个参数使用的偏移量 (这些是负偏移量) *)
+    List.iteri (fun i _ ->
+      if i < 8 then used_offsets := -(68 + i * 4) :: !used_offsets
+    ) ir_func.params;
+    
+    (* 标记额外参数映射到的本地栈位置 (这些也是负偏移量) *)
     List.iteri (fun i _ ->
       if i >= 8 then used_offsets := -(68 + i * 4) :: !used_offsets
     ) ir_func.params;
-    
+
     (* 分析指令中的栈使用情况 *)
     let max_temp = ref (-1) in
-    let min_offset = ref 0 in  (* 跟踪最小偏移量 *)
-    
+    let min_offset = ref 0 in  (* 跟踪最小(最负)偏移量 *)
+
     let analyze_instr = function
       | Store (_, RiscvReg "s0", offset) when offset < 0 ->
           used_offsets := offset :: !used_offsets;
@@ -941,25 +961,32 @@ let instr_to_asm var_offsets frame_size instrs =
       | _ -> ()
     in
     List.iter analyze_instr ir_func.body;
-    
+
     (* 计算局部变量所需空间 *)
     let local_var_size = 
       if !used_offsets <> [] then
         let min_used = !min_offset in
         (* 计算从s0到最小偏移量的距离 *)
-        -min_used - 16  (* 减去16为保存寄存器和参数预留空间 *)
+        -min_used (* 不再减去16，因为base_size已经包含了基本开销 *)
       else 0 in
-    
+
     (* 计算临时寄存器所需空间 *)
     let temp_stack_size = 
       if !max_temp >= 15 then (!max_temp - 14) * 4 else 0 in
-    
+
     (* 总需求空间 *)
-    let required_space = base_size + param_size + local_var_size + temp_stack_size in
-    
+    (* 必须确保栈帧足够大，以容纳: 
+      1. 基本开销 (base_size)
+      2. 访问额外参数所需的空间 (extra_param_space) 
+      3. 本地变量 (local_var_size)
+      4. 临时寄存器 (temp_stack_size)
+      5. 调用其他函数时为参数预留的空间 (call_stack_space)
+    *)
+    let required_space = base_size + local_var_size + temp_stack_size + extra_param_space + !call_stack_space in
+
     (* 对齐到16字节边界 *)
     let aligned_size = ((required_space + 15) / 16) * 16 in
-    
+
     (* 确保最小栈帧大小 *)
     max aligned_size 32
 
