@@ -337,54 +337,38 @@ let rec expr_to_ir state expr =
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
   (* 在 expr_to_ir 函数的 Call 分支中 *)
   | Call (name, args) ->
-      let indexed_args = List.mapi (fun i arg -> (i, arg)) args in
-      
-      (* 先计算所有参数，但不立即释放寄存器 *)
-      let (arg_results, state_after_args) = List.fold_left (
-        fun (acc_results, acc_state) (i, arg_expr) ->
-          let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
-          (acc_results @ [(i, reg, code)], new_state)
-      ) ([], state) indexed_args in
-      
-      (* 处理参数移动 - 优化：直接加载到参数寄存器 *)
-      let (process_codes, regs_to_free) = List.fold_left (
-        fun (acc_code, acc_regs) (i, reg, code) ->
+    (* 使用索引处理参数 *)
+    let indexed_args = List.mapi (fun i arg -> (i, arg)) args in
+    
+    (* 处理参数 *)
+    let (processed_args, final_state) = List.fold_left (
+      fun (acc_results, acc_state) (i, arg_expr) ->
+        let (reg, code, new_state) = expr_to_ir acc_state arg_expr in
+        let process_code = 
           if i < 8 then
-            (* 对于前8个参数，尝试直接加载到参数寄存器以避免额外的mv *)
-            match code with
-            | [Load (temp_reg, base, offset)] -> 
-                (* 如果代码只是简单加载变量，直接加载到参数寄存器 *)
-                (acc_code @ [Load (RiscvReg ("a" ^ string_of_int i), base, offset)], 
-                 acc_regs) (* 不需要释放寄存器，因为我们直接使用了参数寄存器 *)
-            | _ -> 
-                (* 否则，使用原来的mv方式 *)
-                (acc_code @ code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)], 
-                 reg :: acc_regs)
+            (* 前8个参数移动到参数寄存器 *)
+            code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
           else
-            let stack_offset = ((i - 8) * 4) in (* 与被调用函数访问偏移量对应 *)
-            (acc_code @ code @ [Store (reg, RiscvReg "sp", stack_offset)], 
-             reg :: acc_regs)
-      ) ([], []) arg_results in
-      
-      (* 释放所有需要释放的参数寄存器 *)
-      let final_state = List.fold_left (
-        fun acc_state reg ->
-          free_temp acc_state reg
-      ) state_after_args regs_to_free in
-      
-      (* 调用函数 *)
-      let is_void_func = 
-        try
-          let func_info = Hashtbl.find func_table name in
-          func_info.ret_type = Void
-        with Not_found -> false
-      in
-      if is_void_func then
-        let (temp, state') = fresh_temp final_state in
-        (temp, process_codes @ [Call name; Li (temp, 0)], state')
-      else
-        let (result_reg, state') = fresh_temp final_state in
-        (result_reg, process_codes @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
+             let stack_offset = ((i - 8) * 4) in (* 与被调用函数访问偏移量对应 *)
+          code @ [Store (reg, RiscvReg "sp", stack_offset)]
+        in
+        let free_state = free_temp new_state reg in
+        (acc_results @ process_code, free_state)
+    ) ([], state) indexed_args in
+    
+    (* 调用函数 *)
+    let is_void_func = 
+      try
+        let func_info = Hashtbl.find func_table name in
+        func_info.ret_type = Void
+      with Not_found -> false
+    in
+    if is_void_func then
+      let (temp, state') = fresh_temp final_state in
+      (temp, processed_args @ [Call name; Li (temp, 0)], state')
+    else
+      let (result_reg, state') = fresh_temp final_state in
+      (result_reg, processed_args @ [Call name; Mv (result_reg, RiscvReg "a0")], state')
   | Unary (op, e) ->
       let (e_reg, e_code, state') = expr_to_ir state e in
       let (temp, state'') = fresh_temp state' in
