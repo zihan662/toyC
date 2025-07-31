@@ -39,8 +39,10 @@ type codegen_state = {
   loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
   scope_stack: (string, int) Hashtbl.t list; (* 作用域栈 *)
   free_temps: int list; (* 可重用的临时寄存器列表 *)
+  current_function: string; (* 当前函数名 *)
 }
 
+(* 修改 initial_state *)
 let initial_state = {
   temp_counter = 0;
   label_counter = 0;
@@ -49,6 +51,7 @@ let initial_state = {
   loop_labels = [];
   scope_stack = [];
   free_temps = [];
+  current_function = ""; (* 初始为空字符串 *)
 }
 
 (* ==================== 辅助函数 ==================== *)
@@ -66,10 +69,10 @@ let free_temp state temp_reg =
   | Temp n -> {state with free_temps = n :: state.free_temps}
   | RiscvReg _ -> state (* RISC-V寄存器不回收 *)
 
+(* 修改 fresh_label 函数，添加函数名前缀 *)
 let fresh_label state prefix =
-  let label = Printf.sprintf "%s%d" prefix state.label_counter in
+  let label = Printf.sprintf "%s_%s%d" state.current_function prefix state.label_counter in
   (label, {state with label_counter = state.label_counter + 1})
-
 
 (* 修改 get_var_offset_for_use 函数 *)
 let get_var_offset_for_use state var =
@@ -590,7 +593,9 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
-    stack_size = 0; 
+    stack_size = 0;
+    label_counter = 0;
+    current_function = func.name; (* 设置当前函数名 *)
   } in
     (* 为参数设置固定的偏移量，使用负偏移量与标准代码一致 *)
     let state' = 
