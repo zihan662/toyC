@@ -96,14 +96,14 @@ let get_var_offset_for_use state var =
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      let offset = -(100  + state.stack_size) in  (* 从-100开始，避免与参数冲突 *)
+      let offset = -(500  + state.stack_size) in  (* 从-100开始，避免与参数冲突 *)
       Hashtbl.add current_scope var offset;
       let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
   | [] ->
       (* 如果作用域栈为空，创建新的作用域 *)
       let new_scope = Hashtbl.create 10 in
-      let offset = -(100  + state.stack_size) in
+      let offset = -(500  + state.stack_size) in
       Hashtbl.add new_scope var offset;
       let new_state = {state with 
                        scope_stack = new_scope :: state.scope_stack;
