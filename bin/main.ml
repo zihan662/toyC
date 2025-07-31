@@ -34,12 +34,13 @@ type ir_func = {
 type codegen_state = {
   temp_counter: int;
   label_counter: int;
-  var_offset: (string, int) Hashtbl.t; (* 变量在栈帧中的偏移量 *)
-  stack_size: int; (* 当前栈帧大小 *)
-  loop_labels: (string * string) list;  (* (end_label, loop_label) 的栈 *)
-  scope_stack: (string, int) Hashtbl.t list; (* 作用域栈 *)
-  free_temps: int list; (* 可重用的临时寄存器列表 *)
-  current_function: string; (* 当前函数名 *)
+  var_offset: (string, int) Hashtbl.t;
+  stack_size: int;
+  loop_labels: (string * string) list;
+  scope_stack: (string, int) Hashtbl.t list;
+  free_temps: int list;
+  current_function: string;
+  var_usage: (string, bool) Hashtbl.t; (* 跟踪变量是否被使用 *)
 }
 
 (* 修改 initial_state *)
@@ -51,9 +52,9 @@ let initial_state = {
   loop_labels = [];
   scope_stack = [];
   free_temps = [];
-  current_function = ""; (* 初始为空字符串 *)
+  current_function = "";
+  var_usage = Hashtbl.create 10; (* 添加此行 *)
 }
-
 (* ==================== 辅助函数 ==================== *)
 let fresh_temp state = 
   match state.free_temps with
@@ -76,7 +77,9 @@ let fresh_label state prefix =
 
 (* 修改 get_var_offset_for_use 函数 *)
 let get_var_offset_for_use state var =
-  (* 在作用域栈中查找变量，从当前作用域开始向外 *)
+  (* 标记变量为已使用 *)
+  Hashtbl.replace state.var_usage var true;
+  (* 原有逻辑 *)
   let rec lookup scopes =
     match scopes with
     | [] -> None
@@ -86,8 +89,6 @@ let get_var_offset_for_use state var =
          with Not_found ->
            lookup remaining_scopes)
   in
-  
-  (* 只在作用域栈中查找，找不到就报错 *)
   match lookup state.scope_stack with
   | Some offset -> 
       (offset, state)
@@ -96,15 +97,16 @@ let get_var_offset_for_use state var =
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      let offset = -(100  + state.stack_size) in  (* 从-100开始，避免与参数冲突 *)
+      let offset = -(100  + state.stack_size) in
       Hashtbl.add current_scope var offset;
+      Hashtbl.add state.var_usage var false; (* 初始化为未使用 *)
       let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
   | [] ->
-      (* 如果作用域栈为空，创建新的作用域 *)
       let new_scope = Hashtbl.create 10 in
       let offset = -(100  + state.stack_size) in
       Hashtbl.add new_scope var offset;
+      Hashtbl.add state.var_usage var false; (* 初始化为未使用 *)
       let new_state = {state with 
                        scope_stack = new_scope :: state.scope_stack;
                        stack_size = state.stack_size + 4} in
@@ -508,10 +510,22 @@ let rec stmt_to_ir state stmt =
   match stmt with
   | BlockStmt b -> block_to_ir state b
   | DeclStmt (_, name, Some expr) -> (* 带初始化的声明 *)
-      let (expr_reg, expr_code, state') = expr_to_ir state expr in
-      let offset, state'' = get_var_offset_for_declaration state' name in
-      let state''' = free_temp state'' expr_reg in (* 释放表达式寄存器 *)
+    let (expr_reg, expr_code, state') = expr_to_ir state expr in
+    let offset, state'' = get_var_offset_for_declaration state' name in
+    
+    (* 检查变量是否被使用 *)
+    let is_used = 
+      try Hashtbl.find state''.var_usage name 
+      with Not_found -> false in
+    
+    let state''' = free_temp state'' expr_reg in
+    
+    if is_used then
+      (* 如果变量被使用，生成 Store 指令 *)
       (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
+    else
+      (* 如果变量未被使用，跳过 Store 指令 *)
+      (expr_code, state''')
   | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
       let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
