@@ -389,6 +389,36 @@ let rec expr_to_ir state expr =
     let state_final = free_temp (free_temp state''' e1_reg) e2_reg in (* 释放输入寄存器 *)
     
     match op with
+    | And -> 
+        (* 短路求值: 如果第一个表达式为假，则不计算第二个表达式 *)
+        let (false_label, state_false) = fresh_label state''' "and_false" in
+        let (merge_label, state_merge) = fresh_label state_false "and_merge" in
+        let state_final = free_temp state_merge temp in
+        (temp, 
+         e1_code @ 
+         [Branch ("beqz", e1_reg, RiscvReg "zero", false_label)] @
+         e2_code @
+         [Mv (temp, e2_reg);
+          Jmp merge_label;
+          Label false_label;
+          Li (temp, 0);
+          Label merge_label], 
+         state_final)
+    | Or -> 
+        (* 短路求值: 如果第一个表达式为真，则不计算第二个表达式 *)
+        let (true_label, state_true) = fresh_label state''' "or_true" in
+        let (merge_label, state_merge) = fresh_label state_true "or_merge" in
+        let state_final = free_temp state_merge temp in
+        (temp, 
+         e1_code @ 
+         [Branch ("bnez", e1_reg, RiscvReg "zero", true_label)] @
+         e2_code @
+         [Mv (temp, e2_reg);
+          Jmp merge_label;
+          Label true_label;
+          Li (temp, 1);
+          Label merge_label], 
+         state_final)
     | Add -> 
         (temp, e1_code @ e2_code @ [BinaryOp ("add", temp, e1_reg, e2_reg)], state_final)
     | Sub -> 
@@ -447,7 +477,15 @@ let rec expr_to_ir state expr =
           BinaryOp ("sltu", sltu_temp, RiscvReg "zero", xor_temp);
           BinaryOpImm ("xori", temp, sltu_temp, 1)] in
         (temp, code, state_final'')
-  | _ -> failwith "Unsupported expression"
+    | Neq ->
+        (* a != b 转换为 (a ^ b) != 0 *)
+        let (xor_temp, state'''') = fresh_temp state_final in
+        let (sltu_temp, state''''') = fresh_temp state'''' in
+        let state_final'' = free_temp (free_temp state''''' xor_temp) sltu_temp in
+        let code = e1_code @ e2_code @
+          [BinaryOp ("xor", xor_temp, e1_reg, e2_reg);
+          BinaryOp ("sltu", sltu_temp, RiscvReg "zero", xor_temp)] in
+        (temp, code, state_final'')
 
 let enter_scope state =
   let new_scope = Hashtbl.create 10 in
@@ -989,7 +1027,6 @@ let instr_to_asm var_offsets frame_size instrs =
 
     (* 确保最小栈帧大小 *)
     max aligned_size 32
-
   (* 函数序言 - 动态计算栈帧大小 *)
   let function_prologue name frame_size =
     let ra_offset = frame_size - 4 in      (* ra保存在栈帧顶部 *)
