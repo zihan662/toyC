@@ -346,25 +346,31 @@ let rec expr_to_ir state expr =
           (acc_results @ [(i, reg, code)], new_state)
       ) ([], state) indexed_args in
       
-      (* 处理参数移动 *)
-      let process_codes = List.fold_left (
-        fun acc_code (i, reg, code) ->
-          let process_code = 
-            if i < 8 then
-              (* 前8个参数移动到参数寄存器 *)
-              code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
-            else
-              let stack_offset = ((i - 8) * 4) in (* 与被调用函数访问偏移量对应 *)
-              code @ [Store (reg, RiscvReg "sp", stack_offset)]
-          in
-          acc_code @ process_code
-      ) [] arg_results in
+      (* 处理参数移动 - 优化：直接加载到参数寄存器 *)
+      let (process_codes, regs_to_free) = List.fold_left (
+        fun (acc_code, acc_regs) (i, reg, code) ->
+          if i < 8 then
+            (* 对于前8个参数，尝试直接加载到参数寄存器以避免额外的mv *)
+            match code with
+            | [Load (temp_reg, base, offset)] -> 
+                (* 如果代码只是简单加载变量，直接加载到参数寄存器 *)
+                (acc_code @ [Load (RiscvReg ("a" ^ string_of_int i), base, offset)], 
+                 acc_regs) (* 不需要释放寄存器，因为我们直接使用了参数寄存器 *)
+            | _ -> 
+                (* 否则，使用原来的mv方式 *)
+                (acc_code @ code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)], 
+                 reg :: acc_regs)
+          else
+            let stack_offset = ((i - 8) * 4) in (* 与被调用函数访问偏移量对应 *)
+            (acc_code @ code @ [Store (reg, RiscvReg "sp", stack_offset)], 
+             reg :: acc_regs)
+      ) ([], []) arg_results in
       
-      (* 释放所有参数寄存器 *)
+      (* 释放所有需要释放的参数寄存器 *)
       let final_state = List.fold_left (
-        fun acc_state (_, reg, _) ->
+        fun acc_state reg ->
           free_temp acc_state reg
-      ) state_after_args arg_results in
+      ) state_after_args regs_to_free in
       
       (* 调用函数 *)
       let is_void_func = 
@@ -391,17 +397,17 @@ let rec expr_to_ir state expr =
            let state_final = free_temp state'''' ne_temp in
            (temp, e_code @ [BinaryOp ("sltu", ne_temp, RiscvReg "zero", e_reg);
                             BinaryOpImm ("xori", temp, ne_temp, 1)], state_final))
-    | Binary (op, e1, e2) ->
-        let (e1_reg, e1_code, state') = expr_to_ir state e1 in
-        (* 在处理 e2 时，将 e1_reg 标记为不可重用 *)
-        let protected_state = 
-          match e1_reg with
-          | Temp n -> {state' with free_temps = List.filter (fun x -> x <> n) state'.free_temps}
-          | RiscvReg _ -> state'
-        in
-        let (e2_reg, e2_code, state'') = expr_to_ir protected_state e2 in
-        let (temp, state''') = fresh_temp state'' in
-        let state_final = free_temp (free_temp state''' e1_reg) e2_reg in (* 释放输入寄存器 *)
+  | Binary (op, e1, e2) ->
+      let (e1_reg, e1_code, state') = expr_to_ir state e1 in        
+      (* 在处理 e2 时，将 e1_reg 标记为不可重用 *)
+      let protected_state = 
+        match e1_reg with
+        | Temp n -> {state' with free_temps = List.filter (fun x -> x <> n) state'.free_temps}
+        | RiscvReg _ -> state'
+      in
+      let (e2_reg, e2_code, state'') = expr_to_ir protected_state e2 in
+      let (temp, state''') = fresh_temp state'' in
+      let state_final = free_temp (free_temp state''' e1_reg) e2_reg in (* 释放输入寄存器 *)
     
         match op with
         | And -> 
@@ -600,7 +606,7 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { 
     initial_state with 
     var_offset = Hashtbl.create (List.length func.params);
-    stack_size = 0; (* 重置stack_size *)
+    stack_size = 0; 
   } in
     (* 为参数设置固定的偏移量，使用负偏移量与标准代码一致 *)
     let state' = 
