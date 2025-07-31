@@ -511,7 +511,7 @@ let rec stmt_to_ir state stmt =
       let (expr_reg, expr_code, state') = expr_to_ir state expr in
       let offset, state'' = get_var_offset_for_declaration state' name in
       let state''' = free_temp state'' expr_reg in (* 释放表达式寄存器 *)
-      (expr_code , state''')
+      (expr_code @ [Store (expr_reg, RiscvReg "s0", offset)], state''')
   | DeclStmt (_, name, None) -> (* 不带初始化的声明 *)
       let offset, state' = get_var_offset_for_declaration state name in
       ([], state')
