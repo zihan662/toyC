@@ -87,30 +87,29 @@ let get_var_offset_for_use state var =
            lookup remaining_scopes)
   in
   
-  (* 按优先级查找：1.局部作用域 2.全局作用域 *)
+  (* 只在作用域栈中查找，找不到就报错 *)
   match lookup state.scope_stack with
   | Some offset -> 
-      (offset, state)  (* 在某个作用域中找到了变量 *)
+      (offset, state)
   | None ->
-      (* 在全局作用域中查找 *)
-      (try
-         (Hashtbl.find state.var_offset var, state)
-       with Not_found ->
-         (* 变量不存在，这应该是错误情况 *)
-         failwith ("Variable " ^ var ^ " not found"))
+      failwith ("Variable " ^ var ^ " not found in local scopes")
 let get_var_offset_for_declaration state var =
   match state.scope_stack with
   | current_scope :: _ ->
-      (* 为局部变量预留独立的负偏移量空间，避免与参数(-68, -72, ...)冲突 *)
-      let offset = -(68 + 4 + state.stack_size) in  (* 从-72开始，避免与参数冲突 *)
+      let offset = -(100  + state.stack_size) in  (* 从-100开始，避免与参数冲突 *)
       Hashtbl.add current_scope var offset;
       let new_state = {state with stack_size = state.stack_size + 4} in
       (offset, new_state)
   | [] ->
-      let offset = state.stack_size in
-      Hashtbl.add state.var_offset var offset;
-      let new_state = {state with stack_size = offset + 4} in
+      (* 如果作用域栈为空，创建新的作用域 *)
+      let new_scope = Hashtbl.create 10 in
+      let offset = -(100  + state.stack_size) in
+      Hashtbl.add new_scope var offset;
+      let new_state = {state with 
+                       scope_stack = new_scope :: state.scope_stack;
+                       stack_size = state.stack_size + 4} in
       (offset, new_state)
+
 
 (* 将表达式转换为字符串 *)
 let rec string_of_expr = function
@@ -339,6 +338,7 @@ let rec expr_to_ir state expr =
       let (temp, state'') = fresh_temp state' in
       (temp, [Load (temp, RiscvReg "s0", offset)], state'')
   (* 在 expr_to_ir 函数的 Call 分支中 *)
+
   | Call (name, args) ->
     (* 使用索引处理参数 *)
     let indexed_args = List.mapi (fun i arg -> (i, arg)) args in
@@ -589,6 +589,8 @@ and block_to_ir state block =
   (code, exited_state)
 
 
+(* 修改 func_to_ir 函数 *)
+(* 修改 func_to_ir 函数 *)
 let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
   let state = { 
     initial_state with 
@@ -597,14 +599,19 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
     label_counter = 0;
     current_function = func.name; (* 设置当前函数名 *)
   } in
-    (* 为参数设置固定的偏移量，使用负偏移量与标准代码一致 *)
-    let state' = 
+  (* 为参数设置固定的偏移量，并创建初始作用域 *)
+  let param_scope = Hashtbl.create (List.length func.params) in
+  let state_with_scope = { state with scope_stack = [param_scope] } in
+  
+  let state' = 
     List.fold_left (fun st (i, (param : Ast.param)) ->
       (* 使用与标准代码相同的参数偏移量 *)
       let offset = -(68 + i * 4) in  (* 参数偏移量: -68, -72, -76, -80, ... *)
+      Hashtbl.add param_scope param.name offset;
+      (* 同时添加到 var_offset 中，以便在 IRToRiscV 模块中可以找到 *)
       Hashtbl.add st.var_offset param.name offset;
       st
-    ) state (List.mapi (fun i x -> (i, x)) func.params)
+    ) state_with_scope (List.mapi (fun i x -> (i, x)) func.params)
   in
   let (body_code, final_state) = block_to_ir state' func.body in
   {
@@ -612,7 +619,6 @@ let func_to_ir (func : Ast.func_def) : (ir_func * (string, int) Hashtbl.t) =
     params = List.map (fun (p : Ast.param) -> p.name) func.params;
     body = body_code;
   }, final_state.var_offset
-
 
 (* ==================== IR到RISC-V汇编转换 ==================== *)
 (* 在 IRToRiscV 模块内替换现有的 LivenessAnalysis 模块 *)
@@ -744,38 +750,38 @@ let instr_to_asm var_offsets frame_size instrs =
           match instr with
           | Li (r, n) -> 
               (match r with
-              | Temp n when n >= 15 -> 
-                  let stack_offset = -(68 + (n - 15 + 1) * 4) in
+              | Temp temp_reg when temp_reg >= 15 -> 
+                  let stack_offset = -(8 + (temp_reg - 15 + 1) * 4) in
                   Printf.sprintf "  li t0, %d\n  sw t0, %d(s0)" n stack_offset
               | _ -> 
                   Printf.sprintf "  li %s, %d" (reg_map var_offsets frame_size r) n)
           | Mv (rd, rs) ->
               (match (rd, rs) with
               | (Temp n, _) when n >= 15 -> 
-                  let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                  let stack_offset = -(8 + (n - 15 + 1) * 4) in
                   Printf.sprintf "  mv t0, %s\n  sw t0, %d(s0)" (reg_map var_offsets frame_size rs) stack_offset
               | (_, Temp n) when n >= 15 -> 
-                  let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                  let stack_offset = -(8 + (n - 15 + 1) * 4) in
                   Printf.sprintf "  lw t0, %d(s0)\n  mv %s, t0" stack_offset (reg_map var_offsets frame_size rd)
               | _ -> 
                   Printf.sprintf "  mv %s, %s" (reg_map var_offsets frame_size rd) (reg_map var_offsets frame_size rs))
           | BinaryOp (op, rd, rs1, rs2) ->
               (match (rd, rs1, rs2) with
               | (Temp n, _, _) when n >= 15 -> 
-                  let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                  let stack_offset = -(8 + (n - 15 + 1) * 4) in
                   let src1 = reg_map var_offsets frame_size rs1 in
                   let src2 = reg_map var_offsets frame_size rs2 in
                   let (reg1, load1) = 
                     match rs1 with
                     | Temp m when m >= 15 -> 
-                        let offset = -(68 + (m - 15 + 1) * 4) in
+                        let offset = -(8 + (m - 15 + 1) * 4) in
                         ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
                     | _ -> (src1, "")
                   in
                   let (reg2, load2) = 
                     match rs2 with
                     | Temp m when m >= 15 -> 
-                        let offset = -(68 + (m - 15 + 1) * 4) in
+                        let offset = -(8 + (m - 15 + 1) * 4) in
                         ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
                     | _ -> (src2, "")
                   in
@@ -786,14 +792,14 @@ let instr_to_asm var_offsets frame_size instrs =
                   let (reg1, load1) = 
                     match rs1 with
                     | Temp m when m >= 15 -> 
-                        let offset = -(68 + (m - 15 + 1) * 4) in
+                        let offset = -(8 + (m - 15 + 1) * 4) in
                         ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
                     | _ -> (reg_map var_offsets frame_size rs1, "")
                   in
                   let (reg2, load2) = 
                     match rs2 with
                     | Temp m when m >= 15 -> 
-                        let offset = -(68 + (m - 15 + 1) * 4) in
+                        let offset = -(8 + (m - 15 + 1) * 4) in
                         ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
                     | _ -> (reg_map var_offsets frame_size rs2, "")
                   in
@@ -806,18 +812,18 @@ let instr_to_asm var_offsets frame_size instrs =
                   Printf.sprintf "  %s %s, %s, %s" op dest_reg reg1 reg2 ^
                   (match rd with
                     | Temp m when m >= 15 -> 
-                        let stack_offset = -(68 + (m - 15 + 1) * 4) in
+                        let stack_offset = -(8 + (m - 15 + 1) * 4) in
                         Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                     | _ -> ""))
           | BinaryOpImm (op, rd, rs, imm) ->
               (match (rd, rs) with
               | (Temp n, _) when n >= 15 -> 
-                  let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                  let stack_offset = -(8 + (n - 15 + 1) * 4) in
                   let src = reg_map var_offsets frame_size rs in
                   let (reg, load) = 
                     match rs with
                     | Temp m when m >= 15 -> 
-                        let offset = -(68 + (m - 15 + 1) * 4) in
+                        let offset = -(8 + (m - 15 + 1) * 4) in
                         ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
                     | _ -> (src, "")
                   in
@@ -828,7 +834,7 @@ let instr_to_asm var_offsets frame_size instrs =
                   let (reg, load) = 
                     match rs with
                     | Temp m when m >= 15 -> 
-                        let offset = -(68 + (m - 15 + 1) * 4) in
+                        let offset = -(8 + (m - 15 + 1) * 4) in
                         ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
                     | _ -> (reg_map var_offsets frame_size rs, "")
                   in
@@ -841,21 +847,21 @@ let instr_to_asm var_offsets frame_size instrs =
                   Printf.sprintf "  %s %s, %s, %d" op dest_reg reg imm ^
                   (match rd with
                     | Temp m when m >= 15 -> 
-                        let stack_offset = -(68 + (m - 15 + 1) * 4) in
+                        let stack_offset = -(8 + (m - 15 + 1) * 4) in
                         Printf.sprintf "\n  sw t0, %d(s0)" stack_offset
                     | _ -> ""))
           | Branch (cond, rs1, rs2, label) ->
               let (reg1, load1) = 
                 match rs1 with
                 | Temp m when m >= 15 -> 
-                    let offset = -(68 + (m - 15 + 1) * 4) in
+                    let offset = -(8 + (m - 15 + 1) * 4) in
                     ("t1", Printf.sprintf "  lw t1, %d(s0)\n" offset)
                 | _ -> (reg_map var_offsets frame_size rs1, "")
               in
               let (reg2, load2) = 
                 match rs2 with
                 | Temp m when m >= 15 -> 
-                    let offset = -(68 + (m - 15 + 1) * 4) in
+                    let offset = -(8 + (m - 15 + 1) * 4) in
                     ("t2", Printf.sprintf "  lw t2, %d(s0)\n" offset)
                 | _ -> (reg_map var_offsets frame_size rs2, "")
               in
@@ -868,7 +874,7 @@ let instr_to_asm var_offsets frame_size instrs =
               let (reg, load) = 
                 match rs with
                 | Temp m when m >= 15 -> 
-                    let stack_offset = -(68 + (m - 15 + 1) * 4) in
+                    let stack_offset = -(8 + (m - 15 + 1) * 4) in
                     ("t0", Printf.sprintf "  lw t0, %d(s0)\n" stack_offset)
                 | _ -> (reg_map var_offsets frame_size rs, "")
               in
@@ -876,7 +882,7 @@ let instr_to_asm var_offsets frame_size instrs =
           | Load (rd, base, offset) ->
               (match rd with
               | Temp n when n >= 15 -> 
-                  let stack_offset = -(68 + (n - 15 + 1) * 4) in
+                  let stack_offset = -(8 + (n - 15 + 1) * 4) in
                   Printf.sprintf "  lw t0, %d(%s)\n  sw t0, %d(s0)" 
                     offset (reg_map var_offsets frame_size base) stack_offset
               | _ -> 
@@ -887,7 +893,7 @@ let instr_to_asm var_offsets frame_size instrs =
                 let offset = Hashtbl.find var_offsets var_name in
                 (match reg with
                 | Temp n when n >= 15 -> 
-                    let temp_offset = -(68 + (n - 15 + 1) * 4) in
+                    let temp_offset = -(8 + (n - 15 + 1) * 4) in
                     Printf.sprintf "  lw t0, %d(s0)\n  sw t0, %d(s0)" offset temp_offset
                 | _ -> 
                     Printf.sprintf "  lw %s, %d(s0)" (reg_map var_offsets frame_size reg) offset)
@@ -959,7 +965,7 @@ let instr_to_asm var_offsets frame_size instrs =
   (* 计算函数需要的栈帧大小 *)
   let calculate_frame_size (ir_func : ir_func) =
     (* 基础保存空间：ra(4) + s0(4) = 8字节 *)
-    let base_size = 80 in (* 至少16字节用于保存 ra 和 s0 *)
+    let base_size = 108 in (* 至少16字节用于保存 ra 和 s0 *)
     
     (* 计算额外参数需要的空间 *)
     let extra_param_space = 
