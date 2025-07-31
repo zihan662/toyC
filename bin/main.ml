@@ -351,7 +351,8 @@ let rec expr_to_ir state expr =
             code @ [Mv (RiscvReg ("a" ^ string_of_int i), reg)]
           else
             (* 其余参数存储到栈 *)
-            code @ [Store (reg, RiscvReg "sp", -(4 * (i - 8)))]
+             let stack_offset = -(68 + i * 4) in (* 与被调用函数访问偏移量对应 *)
+          code @ [Store (reg, RiscvReg "s0", stack_offset)]
         in
         let free_state = free_temp new_state reg in
         (acc_results @ process_code, free_state)
