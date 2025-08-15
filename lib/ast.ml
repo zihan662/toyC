@@ -24,7 +24,7 @@ type stmt =
   | BlockStmt of block                (* 语句块，如 { ... } *)
   | EmptyStmt                         (* 空语句，如 ; *)
   | ExprStmt of expr                  (* 表达式语句，如 a = 5; *)
-  | DeclStmt of typ * string * expr option (* 变量声明，如 int a = 10; *)
+  | DeclStmt of typ * string * expr   (* 变量声明，如 int a = 10; *)
   | AssignStmt of string * expr       (* 赋值语句，如 a = 5; *)
   | IfStmt of expr * stmt * stmt option (* if 语句，如 if (a>5) { ... } else { ... } *)
   | WhileStmt of expr * stmt          (* while 语句，如 while (a>0) { ... } *)

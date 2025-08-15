@@ -60,12 +60,12 @@ stmt_list:
   ;
 
 stmt:
-  (* Stmt 的多分支：Block | “;” | Expr “;” | ID “=” Expr “;” | “int” ID “=” Expr “;” | if/while/break/continue/return *)
+  (* Stmt 的多分支：Block | ";" | Expr ";" | ID "=" Expr ";" | "int" ID "=" Expr ";" | if/while/break/continue/return *)
   | block = block { BlockStmt block }                  (* 语句块 *)
   | SEMI { EmptyStmt }                                (* 空语句 *)
   | expr = expr SEMI { ExprStmt expr }                (* 表达式语句 *)
   | name = ID ASSIGN expr = expr SEMI { AssignStmt (name, expr) } (* 赋值语句 *)
-  | INT name = ID ASSIGN expr = expr SEMI { DeclStmt (Int, name, Some expr) } (* 变量声明+赋值 *)
+  | INT name = ID ASSIGN expr = expr SEMI { DeclStmt (Int, name, expr) } (* 变量声明+赋值 *)
   | IF LPAREN cond = expr RPAREN then_stmt = stmt
     { IfStmt (cond, then_stmt, None) }           (* if 语句，无 else *)
   | IF LPAREN cond = expr RPAREN then_stmt = stmt ELSE else_stmt = stmt
